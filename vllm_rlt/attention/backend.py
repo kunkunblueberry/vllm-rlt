@@ -53,13 +53,16 @@ _TRITON_CAPABILITIES = BackendCapabilities(
 )
 _FLASH_CAPABILITIES = {
     2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
-    3: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
+    3: BackendCapabilities(
+        cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sparse_decode=True
+    ),
     4: BackendCapabilities(
         packed_prefill=True,
         cuda_graphs=True,
         async_scheduling=True,
         packed_matches_decode=True,
         device_context_lengths=True,
+        sparse_decode=True,
     ),
 }
 _AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")

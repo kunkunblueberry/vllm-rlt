@@ -165,3 +165,40 @@ def test_reference_growth_rejects_foreign_stream():
     with pytest.raises(RuntimeError, match="owner stream"):
         store.ensure_key_capacity(3)
     assert store.selected.shape[-1] == 2
+
+
+@pytest.mark.gpu
+def test_sparse_score_and_value_kernels_address_large_kv_offsets():
+    from vllm_rlt.kernels.sparse_capture import fused_capture_scores
+    from vllm_rlt.kernels.sparse_consume import selected_scores, selected_values
+
+    dim, block_size = 8, 2
+    block_stride = 1 << 30
+    elements = 2 * block_stride + block_size * dim
+    if torch.cuda.mem_get_info()[0] < elements * 2 + (64 << 20):
+        pytest.skip("large-offset BF16 cache test needs just over 4 GiB of free device memory")
+    # Physical block 2 starts at element 2**31. Only its two tokens are touched.
+    storage = torch.empty(elements, device="cuda", dtype=torch.bfloat16)
+    cache = storage.as_strided((3, block_size, 1, dim), (block_stride, dim, dim, 1))
+    cache[2, 0].fill_(2)
+    cache[2, 1].fill_(3)
+    q = torch.ones(1, 1, dim, device="cuda", dtype=torch.bfloat16)
+    tables = torch.tensor([[2]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([2], device="cuda", dtype=torch.int32)
+    selected = torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int32)
+    probabilities = torch.tensor([[[0.25, 0.75]]], device="cuda")
+    expected_scores = torch.tensor([[[16.0, 24.0]]], device="cuda")
+    expected_values = torch.full((1, 1, dim), 2.75, device="cuda")
+
+    torch.testing.assert_close(
+        fused_capture_scores(q, cache, tables, lengths, layer=0, block_size=block_size),
+        expected_scores,
+    )
+    torch.testing.assert_close(
+        selected_scores(q, cache, selected, tables, layer=0, block_size=block_size),
+        expected_scores,
+    )
+    torch.testing.assert_close(
+        selected_values(probabilities, cache, selected, tables, layer=0, block_size=block_size),
+        expected_values,
+    )
