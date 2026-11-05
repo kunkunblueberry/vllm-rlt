@@ -250,17 +250,19 @@ execution = ExecutionConfig(async_scheduling=False, cuda_graphs=False)
 ```
 
 This path supports ordinary synchronous decode and synchronous/asynchronous
-block self-speculation with LAST_EXITED KV and refill scheduling. The Torch and
-Triton adapters declare sparse-reference support; `auto` selects a compatible
-adapter and explicit FlashAttention selection fails rather than silently
-replacing the requested backend. Dense and capture rows preserve the selected
-backend's output and original packed batch geometry. Selection, retained mass
-and contributions, and partial-retention correction use the shared PyTorch
-reference implementation. The captured output is the value actually entering
-the recurrence, stored in FP32 after the backend's output-dtype conversion.
-It has host readbacks and per-row launch costs; enabling it does not
-promise faster serving. CUDA Graphs, token pipelines, mixed scheduling,
-preemption/recovery and ordinary asynchronous decode are rejected explicitly.
+block self-speculation with LAST_EXITED KV and refill scheduling. Torch,
+Triton and the paged FlashAttention-3 and FlashAttention-4 adapters support
+sparse decode. `auto` uses the normal priority among compatible adapters.
+Dense and capture rows preserve the selected backend's output and original
+packed batch geometry. On CUDA, the shared sparse implementation computes
+selection and correction. With `implementation="fused"`, uniform capture
+and consume submissions use fused kernels at partial retention. FlashAttention
+capture still runs the selected dense kernel and a separate pass over the keys
+for selection. The captured output is the value actually entering the recurrence,
+stored in FP32 after the backend's output-dtype conversion. The batched path
+can read metadata back to the host. CUDA Graphs, token pipelines, mixed
+scheduling, preemption/recovery and ordinary asynchronous decode are rejected
+explicitly.
 
 The retained count is `min(N, max(1, ceil(N * key_retention)))`, including the
 current position among the N causal keys. `key_bucket` controls buffer capacity,

@@ -1,11 +1,12 @@
 """Ordinary and synchronous block decode through the shared sparse contract."""
 
+from contextlib import closing
 from dataclasses import replace
 
 import pytest
 import torch
 
-from tests.helpers import tiny_ouro_model
+from tests.helpers import tiny_ouro_config, tiny_ouro_model
 from vllm_rlt import (
     CacheConfig,
     ExecutionConfig,
@@ -15,11 +16,19 @@ from vllm_rlt import (
     SpeculativeConfig,
 )
 from vllm_rlt.attention import BackendCapabilities, create_backend
-from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE
+from vllm_rlt.attention.sparse import (
+    CAPTURE,
+    CONSUME,
+    DENSE,
+    reference_paged_attention,
+    sparse_paged_attention,
+)
 from vllm_rlt.engine.stage_engine import StageEngine
+from vllm_rlt.kernels.flash_attention import select_version
+from vllm_rlt.models import OuroForCausalLM
 
 
-def engine(*, draft=None, retention=1.0, device="cpu", dtype=torch.float32, **options):
+def engine(*, draft=None, retention=1.0, device="cpu", dtype=torch.float32, model=None, **options):
     values = dict(
         attention_backend="triton" if device == "cuda" else "torch",
         cache_config=CacheConfig(512, 2, incremental_allocation=True),
@@ -35,7 +44,7 @@ def engine(*, draft=None, retention=1.0, device="cpu", dtype=torch.float32, **op
         ),
     )
     values.update(options)
-    return StageEngine(tiny_ouro_model(device, dtype), **values)
+    return StageEngine(tiny_ouro_model(device, dtype) if model is None else model, **values)
 
 
 def generate(e, count=3):
@@ -139,6 +148,102 @@ def test_backend_explicitly_declares_sparse_reference_support():
         required_capabilities=BackendCapabilities(sparse_decode=True),
     )
     assert selected.capabilities.sparse_decode
+
+
+@pytest.fixture(params=["flash_attn_3", "flash_attn_4"])
+def flash_sparse_backend(request):
+    backend = request.param
+    try:
+        select_version(torch.cuda.get_device_capability(), backend)
+    except ValueError as error:
+        pytest.skip(str(error))
+    pytest.importorskip(
+        "flash_attn_3.flash_attn_interface" if backend == "flash_attn_3" else "flash_attn.cute"
+    )
+    return backend
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "draft,asynchronous", [(None, False), (1, False), (2, False), (1, True), (2, True)]
+)
+def test_cuda_flash_sparse_full_retention_matches_dense(flash_sparse_backend, draft, asynchronous):
+    torch.manual_seed(123)
+    model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
+    options = dict(
+        draft=draft,
+        model=model,
+        attention_backend=flash_sparse_backend,
+        cache_config=CacheConfig(64, 16, incremental_allocation=True),
+        execution_config=ExecutionConfig(
+            async_scheduling=asynchronous, multi_stream=asynchronous, static_buffers=True
+        ),
+    )
+    with closing(engine(retention=None, **options)) as dense:
+        expected = generate(dense)
+    with closing(engine(**options)) as sparse:
+        assert generate(sparse) == expected
+
+
+@pytest.mark.gpu
+def test_cuda_flash_sparse_fused_capture_and_correction(flash_sparse_backend):
+    from vllm_rlt.worker.attention_reference import AttentionReferenceStore
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    backend = create_backend(
+        flash_sparse_backend,
+        device,
+        dtype,
+        128,
+        16,
+        required_capabilities=BackendCapabilities(sparse_decode=True),
+    )
+    torch.manual_seed(157)
+    keys = torch.randn(12, 16, 2, 128, device=device, dtype=dtype)
+    values = torch.randn_like(keys)
+    q = torch.randn(3, 4, 128, device=device, dtype=dtype)
+    tables = torch.tensor([[1, 0, 0], [3, 2, 0], [8, 5, 11]], device=device, dtype=torch.int32)
+    lengths = torch.tensor([1, 31, 47], device=device, dtype=torch.int32)
+    expected = backend(q, keys, values, tables, lengths)
+    corrected = []
+    for implementation, attend in (
+        ("fused", sparse_paged_attention),
+        ("batched", reference_paged_attention),
+    ):
+        store = AttentionReferenceStore(
+            slots=3,
+            layers=1,
+            heads=4,
+            head_dim=128,
+            key_bucket=48,
+            device=device,
+            implementation=implementation,
+        )
+        lease = store.reserve("ragged", 0, 3, generation=1)
+        owners = [(lease, row) for row in range(3)]
+        capture = store.build_plan(owners, [CAPTURE] * 3, key_retention=0.25)
+        consume = store.build_plan(owners, [CONSUME] * 3, key_retention=0.25)
+        out = attend(q, keys, values, tables, lengths, capture, layer=0, dense_attention=backend)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            store.output[list(lease.slots), 0], expected.float(), atol=0, rtol=0
+        )
+        corrected.append(
+            attend(
+                -q,
+                keys,
+                values.roll(1, dims=1),
+                tables,
+                lengths,
+                consume,
+                layer=0,
+                dense_attention=backend,
+            )
+        )
+        store.release(lease)
+    # BF16 output may round differently when the FP32 reductions are fused.
+    torch.testing.assert_close(corrected[0], corrected[1], atol=0.02, rtol=0.02)
 
 
 @pytest.mark.gpu

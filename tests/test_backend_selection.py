@@ -53,8 +53,19 @@ def test_cpu_auto_reports_torch_and_runs_reference_attention(caplog):
     torch.testing.assert_close(selected(q, k, v, table, lengths), explicit(q, k, v, table, lengths))
 
 
-def test_sparse_auto_filters_flash_and_explicit_flash_fails(packages, monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+@pytest.mark.parametrize(
+    "sm,missing,expected",
+    [
+        ((9, 0), [], "flash_attn_4"),
+        ((9, 0), ["flash_attn.cute"], "flash_attn_3"),
+        ((9, 0), ["flash_attn.cute", "flash_attn_3.flash_attn_interface"], "triton"),
+        ((10, 0), [], "flash_attn_4"),
+        ((12, 0), [], "triton"),
+    ],
+)
+def test_sparse_auto_uses_a_compatible_backend(packages, monkeypatch, sm, missing, expected):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
+    packages.difference_update(missing)
     required = BackendCapabilities(sparse_decode=True)
     selected = create_backend(
         "auto",
@@ -64,16 +75,19 @@ def test_sparse_auto_filters_flash_and_explicit_flash_fails(packages, monkeypatc
         16,
         required_capabilities=required,
     )
-    assert selected.info["selected_backend"] == "triton"
-    assert "sparse_decode" in selected.info["selection_reason"]
+    assert selected.info["selected_backend"] == expected
+
+
+def test_sparse_explicit_flash2_remains_unsupported(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 0))
     with pytest.raises(ValueError, match="lacks required capabilities: sparse_decode"):
         create_backend(
-            "flash_attn_4",
+            "flash_attn_2",
             torch.device("cuda"),
             torch.bfloat16,
             128,
-            16,
-            required_capabilities=required,
+            256,
+            required_capabilities=BackendCapabilities(sparse_decode=True),
         )
 
 
