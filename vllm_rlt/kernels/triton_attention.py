@@ -344,7 +344,8 @@ def paged_attention(
         # GQA: batch the query heads that share a KV head into one program so the KV tile is
         # loaded once per group instead of once per head. MHA keeps the per-head kernel,
         # which measures faster there because there is nothing to share.
-        block_h = min(_GROUPED_BLOCK_H, head_groups)
+        # `tl.arange` needs a power of two; the group bound is enforced by the head mask.
+        block_h = min(_GROUPED_BLOCK_H, triton.next_power_of_2(head_groups))
         kernel = _paged_attention_grouped_kernel
         grid = (rows, triton.cdiv(heads, block_h), NUM_SPLITS)
     else:
