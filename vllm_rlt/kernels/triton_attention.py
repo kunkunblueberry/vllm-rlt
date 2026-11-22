@@ -173,6 +173,161 @@ def _paged_attention_merge_kernel(
     )
 
 
+@triton.jit
+def _paged_attention_group_kernel(
+    Q,
+    K,
+    V,
+    TABLES,
+    LENGTHS,
+    PART_M,
+    PART_L,
+    PART_O,
+    KS,
+    VS,
+    q_batch_stride,
+    q_head_stride,
+    k_block_stride,
+    k_token_stride,
+    k_head_stride,
+    v_block_stride,
+    v_token_stride,
+    v_head_stride,
+    table_stride,
+    s_block_stride,
+    s_token_stride,
+    s_head_stride,
+    HAS_SCALE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HEAD_GROUPS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    SPLITS: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    PRECISION: tl.constexpr,
+):
+    """GQA decode built on the paged-prefill kernel's shape.
+
+    `_paged_prefill_kernel` already solves "many query rows share one KV tile": it keeps a
+    per-row online-softmax state and drives the tile through two `tl.dot`s. Decode needs the
+    same thing with the query rows being the query heads of one KV group, so this kernel
+    reuses that structure verbatim (same accumulator/correction/rescale order, same FP8
+    dequantize-then-narrow path) and only changes what a "row" is and drops the causal mask.
+
+    It targets the measured defect of the per-head kernel: with HEAD_GROUPS query heads per
+    KV head, that kernel launched HEAD_GROUPS programs which each walked the same tile, so
+    instructions (and loads) were repeated per head. Here one program owns a
+    [BLOCK_H, BLOCK_T] score tile, so the KV tile is loaded once and a tensor-core dot
+    serves the whole group.
+    """
+    row = tl.program_id(0)
+    head_block = tl.program_id(1)
+    split = tl.program_id(2)
+    first_head = head_block * BLOCK_H
+    heads = first_head + tl.arange(0, BLOCK_H)
+    # Heads past this KV head's group belong to the next KV head; they compute garbage that
+    # is masked at the store, so their scores are forced to -inf to keep the exponentials
+    # finite and identical to an empty softmax.
+    in_group = (tl.arange(0, BLOCK_H) < HEAD_GROUPS) & (heads < NUM_HEADS)
+    kv_head = first_head // HEAD_GROUPS
+    length = tl.load(LENGTHS + row)
+    # WINDOW=0 covers the full context, matching the per-head kernel's semantics.
+    covered = length if WINDOW == 0 else tl.minimum(length, WINDOW)
+    window_start = length - covered
+    # Tile-aligned equal parts of the covered range, as the per-head kernel splits them, so a
+    # row's result does not depend on the batch it ran in.
+    split_tokens = ((covered + SPLITS - 1) // SPLITS + BLOCK_T - 1) // BLOCK_T * BLOCK_T
+    begin = window_start + split * split_tokens
+    end = tl.minimum(length, begin + split_tokens)
+    dims = tl.arange(0, BLOCK_D)
+    dim_valid = dims < HEAD_DIM
+    query = tl.load(
+        Q
+        + row * q_batch_stride
+        + heads[:, None] * q_head_stride
+        + dims[None, :],
+        mask=in_group[:, None] & dim_valid[None, :],
+        other=0.0,
+    )
+    maximum = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+    normalizer = tl.zeros((BLOCK_H,), tl.float32)
+    accumulator = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
+    if end > begin:
+        for start in range(begin, end, BLOCK_T):
+            keys_pos = start + tl.arange(0, BLOCK_T)
+            key_valid = keys_pos < end
+            blocks = tl.load(
+                TABLES + row * table_stride + keys_pos // PAGE_SIZE,
+                mask=key_valid,
+                other=0,
+            ).to(tl.int64)
+            offsets = keys_pos % PAGE_SIZE
+            kv_mask = key_valid[:, None] & dim_valid[None, :]
+            key_pointers = (
+                K
+                + blocks[:, None] * k_block_stride
+                + offsets[:, None] * k_token_stride
+                + kv_head * k_head_stride
+                + dims[None, :]
+            )
+            if HAS_SCALE:
+                scale_offsets = (
+                    blocks * s_block_stride + offsets * s_token_stride + kv_head * s_head_stride
+                )
+                keys = tl.where(
+                    kv_mask, tl.load(key_pointers, mask=kv_mask).to(tl.float32), 0.0
+                )
+                keys = keys * tl.load(KS + scale_offsets, mask=key_valid, other=0.0)[:, None]
+                keys = keys.to(Q.dtype.element_ty)
+            else:
+                keys = tl.load(key_pointers, mask=kv_mask, other=0.0)
+            scores = tl.dot(query, tl.trans(keys), input_precision=PRECISION) * SCALE
+            # Decode has one query position per row, which sits at the end of the context, so
+            # there is no causal mask; only out-of-group heads are excluded.
+            scores = tl.where(key_valid[None, :], scores, -float("inf"))
+            next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
+            safe = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
+            correction = tl.exp(maximum - safe)
+            weights = tl.exp(scores - safe[:, None])
+            value_pointers = (
+                V
+                + blocks[:, None] * v_block_stride
+                + offsets[:, None] * v_token_stride
+                + kv_head * v_head_stride
+                + dims[None, :]
+            )
+            if HAS_SCALE:
+                values = tl.where(
+                    kv_mask, tl.load(value_pointers, mask=kv_mask).to(tl.float32), 0.0
+                )
+                values = values * tl.load(VS + scale_offsets, mask=key_valid, other=0.0)[:, None]
+                values = values.to(Q.dtype.element_ty)
+            else:
+                values = tl.load(value_pointers, mask=kv_mask, other=0.0)
+            rounded = weights.to(values.dtype)
+            partial = tl.dot(rounded, values, input_precision=PRECISION)
+            accumulator = accumulator * correction[:, None] + partial
+            normalizer = normalizer * correction + tl.sum(weights, axis=1)
+            maximum = next_maximum
+    # A head outside the group (or a part covering no keys) yields (-inf, 0, 0), which the
+    # merge kernel already weights by zero.
+    out = accumulator / tl.maximum(normalizer, 1e-30)[:, None]
+    maximum = tl.where(normalizer > 0, maximum, -float("inf"))
+    part = (row * NUM_HEADS + heads) * SPLITS + split
+    store_mask = heads < NUM_HEADS
+    tl.store(PART_M + part, maximum, mask=store_mask)
+    tl.store(PART_L + part, normalizer, mask=store_mask)
+    tl.store(
+        PART_O + part[:, None] * BLOCK_D + dims[None, :],
+        tl.where(in_group[:, None], out, 0.0),
+        mask=store_mask[:, None] & dim_valid[None, :],
+    )
+
+
 def paged_attention(
     q,
     key_cache,
@@ -203,6 +358,45 @@ def paged_attention(
     part_m = torch.empty((rows, heads, NUM_SPLITS), device=q.device, dtype=torch.float32)
     part_l = torch.empty_like(part_m)
     part_o = torch.empty((rows, heads, NUM_SPLITS, block_d), device=q.device, dtype=torch.float32)
+    head_groups = heads // key_cache.shape[2]
+    if head_groups > 1:
+        # GQA: reuse the prefill kernel's many-rows-one-tile structure with the query heads
+        # of a KV group as the rows, so the tile is loaded once per group instead of once
+        # per head. MHA keeps the per-head kernel, which measures faster there.
+        block_h = min(head_groups, 16)
+        _paged_attention_group_kernel[(rows, triton.cdiv(heads, block_h), NUM_SPLITS)](
+            q,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            part_m,
+            part_l,
+            part_o,
+            key_scale,
+            value_scale,
+            *q.stride(),
+            *key_cache.stride(),
+            *value_cache.stride(),
+            block_tables.stride(0),
+            *scale_strides,
+            HAS_SCALE=has_scale,
+            HEAD_DIM=q.shape[-1],
+            HEAD_GROUPS=head_groups,
+            NUM_HEADS=heads,
+            PAGE_SIZE=key_cache.shape[1],
+            SCALE=q.shape[-1] ** -0.5,
+            BLOCK_D=block_d,
+            BLOCK_T=32,
+            SPLITS=NUM_SPLITS,
+            WINDOW=window,
+            BLOCK_H=block_h,
+            PRECISION="ieee" if q.dtype == torch.float32 else "tf32",
+            num_warps=4,
+            num_stages=2,
+        )
+        _merge_parts(part_m, part_l, part_o, output, q, rows, heads, block_d)
+        return output
     _paged_attention_kernel[(rows, heads, NUM_SPLITS)](
         q,
         key_cache,
@@ -231,6 +425,12 @@ def paged_attention(
         WINDOW=window,
         num_warps=4,
     )
+    _merge_parts(part_m, part_l, part_o, output, q, rows, heads, block_d)
+    return output
+
+
+def _merge_parts(part_m, part_l, part_o, output, q, rows, heads, block_d):
+    """Collapse the split-KV partials into the output rows (shared by both decode kernels)."""
     _paged_attention_merge_kernel[(rows, heads)](
         part_m,
         part_l,
@@ -243,7 +443,6 @@ def paged_attention(
         SPLITS=NUM_SPLITS,
         num_warps=4,
     )
-    return output
 
 
 @triton.jit
