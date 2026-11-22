@@ -382,6 +382,7 @@ def paged_attention(
         HEAD_DIM=q.shape[-1],
         HEAD_GROUPS=head_groups,
         NUM_HEADS=heads,
+        PAGE_SIZE=key_cache.shape[1],
         SCALE=q.shape[-1] ** -0.5,
         BLOCK_D=block_d,
         BLOCK_T=32,
