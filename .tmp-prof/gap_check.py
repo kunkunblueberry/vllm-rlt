@@ -8,6 +8,7 @@ rather than the GPU waiting.
 """
 
 import sys
+import time
 
 sys.path.insert(0, "/root/kun/rlt-perf/fused")
 import torch
