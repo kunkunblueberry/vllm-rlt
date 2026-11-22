@@ -6,7 +6,7 @@ arithmetic: the eager PyTorch expressions in ``vllm_rlt/layers`` are the numeric
 reference, and ``docs/precision-policy.md`` pins their rounding (FP32 variance for
 RMSNorm, FP32 frequencies and phase for RoPE).
 
-Two findings from building them are worth recording, because both are traps that a
+Three findings from building them are worth recording, because each is a trap that a
 straight port of vLLM's kernels would fall into:
 
 1. **vLLM's RoPE pairs interleaved dimensions** (``IS_NEOX=false`` is its default), while
@@ -15,12 +15,15 @@ straight port of vLLM's kernels would fall into:
    inputs), not a rounding difference.
 2. **Triton contracts ``a*b + c*d`` into a single FP32 multiply-add**, giving one rounding
    where eager PyTorch gives three (one per product, one per add). That is a visible
-   0.0156 BF16 difference. The kernel therefore forces each product through an explicit
-   round-to-activation-dtype barrier. With the barrier, results are bitwise equal to eager.
+   0.0156 BF16 difference. Each product therefore goes through an explicit
+   round-to-activation-dtype barrier written in inline PTX, which the compiler cannot
+   fold. With the barrier, results are bitwise equal to eager.
+3. **The BF16 and FP16 barriers must be separate ``@triton.jit`` functions.** Branching on
+   a runtime flag inside one helper makes Triton unify two different return types and the
+   kernel fails to compile.
 
-RMSNorm's FP32 reduction order still differs from PyTorch's for FP16/FP32 inputs, so those
-two dtypes only take the fused path when a verified kernel exists for them; see
-``fused_rmsnorm`` and the parity tests for the exact scope.
+RMSNorm's FP32 reduction order matches PyTorch's for BF16 activations but not for
+FP16/FP32, so only BF16 is admitted; see :func:`fused_precision_ok`.
 """
 
 import torch
@@ -57,16 +60,16 @@ def fused_precision_ok(dtype: torch.dtype) -> bool:
 
 
 @triton.jit
-def _round_to_activation(X, IS_F16: tl.constexpr):
-    """Round FP32 to the activation dtype as a compiler barrier.
+def _round_f16(X):
+    """Round FP32 to float16 through PTX so the compiler cannot fold it into an FMA."""
+    return tl.inline_asm_elementwise(
+        "cvt.rn.f16.f32 $0, $1;", "=h,r", [X], dtype=tl.float16, is_pure=True, pack=1
+    )
 
-    A plain ``.to(dtype)`` is folded into the following FMA, which is exactly the
-    one-rounding vs three-rounding mismatch this kernel must avoid.
-    """
-    if IS_F16:
-        return tl.inline_asm_elementwise(
-            "cvt.rn.f16.f32 $0, $1;", "=h,r", [X], dtype=tl.float16, is_pure=True, pack=1
-        )
+
+@triton.jit
+def _round_bf16(X):
+    """Round FP32 to bfloat16 through PTX so the compiler cannot fold it into an FMA."""
     return tl.inline_asm_elementwise(
         "cvt.rn.bf16.f32 $0, $1;", "=h,r", [X], dtype=tl.bfloat16, is_pure=True, pack=1
     )
@@ -109,7 +112,7 @@ def _rotary_apply_kernel(
     BLOCK_D: tl.constexpr,
     IS_F16: tl.constexpr,
 ):
-    """Apply precomputed cos/sin to q and k in place of ``rotate_half`` broadcasts.
+    """Apply precomputed cos/sin instead of materialising ``rotate_half`` broadcasts.
 
     ``cos``/``sin`` stay an input: the layer builds one table per decode step and every
     layer reuses it, so building them here would move work rather than remove it.
@@ -129,8 +132,12 @@ def _rotary_apply_kernel(
         q_partner = tl.load(Q + base + partner, mask=valid, other=0.0)
         rotated = tl.where(dims < half, -q_partner, q_partner)
         # Two separately rounded products, then the add: eager's three roundings.
-        q1 = _round_to_activation((q * cos).to(tl.float32), IS_F16)
-        q2 = _round_to_activation((rotated * sin).to(tl.float32), IS_F16)
+        if IS_F16:
+            q1 = _round_f16((q * cos).to(tl.float32))
+            q2 = _round_f16((rotated * sin).to(tl.float32))
+        else:
+            q1 = _round_bf16((q * cos).to(tl.float32))
+            q2 = _round_bf16((rotated * sin).to(tl.float32))
         tl.store(OUT_Q + base + dims, q1 + q2, mask=valid)
 
         if head < GROUPS:
@@ -138,8 +145,12 @@ def _rotary_apply_kernel(
             k = tl.load(K + kbase + dims, mask=valid, other=0.0)
             k_partner = tl.load(K + kbase + partner, mask=valid, other=0.0)
             k_rotated = tl.where(dims < half, -k_partner, k_partner)
-            k1 = _round_to_activation((k * cos).to(tl.float32), IS_F16)
-            k2 = _round_to_activation((k_rotated * sin).to(tl.float32), IS_F16)
+            if IS_F16:
+                k1 = _round_f16((k * cos).to(tl.float32))
+                k2 = _round_f16((k_rotated * sin).to(tl.float32))
+            else:
+                k1 = _round_bf16((k * cos).to(tl.float32))
+                k2 = _round_bf16((k_rotated * sin).to(tl.float32))
             tl.store(OUT_K + kbase + dims, k1 + k2, mask=valid)
 
 
