@@ -98,7 +98,7 @@ def test_fused_rmsnorm_rejects_out_of_contract_input():
 def test_fused_rope_matches_eager_bitwise(dtype, rows, heads, groups):
     torch.manual_seed(0)
     head_dim = 128
-    rotary = RotaryEmbedding(head_dim=head_dim, rope_theta=1e6).to(dtype)
+    rotary = RotaryEmbedding(head_dim=head_dim, rope_theta=1e6).to("cuda", dtype)
     q = torch.randn(rows, heads, head_dim, device="cuda", dtype=dtype)
     k = torch.randn(rows, groups, head_dim, device="cuda", dtype=dtype)
     positions = torch.arange(rows, device="cuda", dtype=torch.int64)
@@ -144,7 +144,7 @@ def test_fused_rope_rounds_each_product_separately():
 @requires_cuda
 def test_fused_rope_handles_nonzero_and_sparse_positions():
     torch.manual_seed(2)
-    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to(torch.bfloat16)
+    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to("cuda", torch.bfloat16)
     q = torch.randn(5, 16, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(5, 16, 128, device="cuda", dtype=torch.bfloat16)
     positions = torch.tensor([0, 1, 63, 1024, 32768], device="cuda", dtype=torch.int64)
@@ -158,7 +158,7 @@ def test_fused_rope_handles_nonzero_and_sparse_positions():
 @requires_cuda
 def test_fused_rope_is_stateless_across_calls():
     torch.manual_seed(3)
-    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to(torch.bfloat16)
+    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to("cuda", torch.bfloat16)
     for _ in range(3):
         q = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
@@ -174,7 +174,7 @@ def test_fused_rope_is_stateless_across_calls():
 def test_fused_rope_covers_supported_head_dims(dtype, head_dim):
     if not torch.cuda.is_available():
         pytest.skip("needs a CUDA device")
-    rotary = RotaryEmbedding(head_dim=head_dim, rope_theta=1e4).to(dtype)
+    rotary = RotaryEmbedding(head_dim=head_dim, rope_theta=1e4).to("cuda", dtype)
     q = torch.randn(3, 4, head_dim, device="cuda", dtype=dtype)
     k = torch.randn(3, 2, head_dim, device="cuda", dtype=dtype)
     positions = torch.arange(3, device="cuda", dtype=torch.int64)
@@ -186,7 +186,7 @@ def test_fused_rope_covers_supported_head_dims(dtype, head_dim):
 
 @requires_cuda
 def test_fused_rope_rejects_non_contiguous_input():
-    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to(torch.bfloat16)
+    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to("cuda", torch.bfloat16)
     q = torch.randn(16, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(0, 1)
     k = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
     positions = torch.arange(4, device="cuda", dtype=torch.int64)
@@ -206,7 +206,7 @@ def test_fused_ops_survive_cuda_graph_replay():
     width, rows = 2048, 8
     norm = _random_norm(width, torch.bfloat16)
     hidden = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
-    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to(torch.bfloat16)
+    rotary = RotaryEmbedding(head_dim=128, rope_theta=1e6).to("cuda", torch.bfloat16)
     q = torch.randn(rows, 16, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(rows, 16, 128, device="cuda", dtype=torch.bfloat16)
     positions = torch.arange(rows, device="cuda", dtype=torch.int64)
