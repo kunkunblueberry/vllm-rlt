@@ -4,6 +4,10 @@
 import torch
 from torch import nn
 
+from vllm_rlt.kernels.fused_norm_rope import fuse_norm_rope, fused_rotary_apply
+
+_FUSED_ROPE_DTYPES = (torch.float16, torch.bfloat16)
+
 
 def rotate_half(value: torch.Tensor) -> torch.Tensor:
     """Rotate half the hidden dimensions of the input tensor."""
@@ -17,7 +21,25 @@ def apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Applies Rotary Position Embedding (RoPE) to Query and Key states."""
+    """Applies Rotary Position Embedding (RoPE) to Query and Key states.
+
+    A fused Triton kernel is used when it reproduces this expression exactly;
+    otherwise the eager form below runs and remains the reference.
+    """
+    if (
+        fuse_norm_rope()
+        and q.is_cuda
+        and q.dtype in _FUSED_ROPE_DTYPES
+        and q.dim() == 3
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and q.shape[-1] in (64, 128, 256)
+        and q.dtype == k.dtype
+        and cos.dtype == q.dtype
+        and cos.shape[0] == q.shape[0]
+        and cos.shape[-1] == q.shape[-1]
+    ):
+        return fused_rotary_apply(q, k, cos, sin)
     q_embed = q * cos + rotate_half(q) * sin
     k_embed = k * cos + rotate_half(k) * sin
     return q_embed, k_embed
