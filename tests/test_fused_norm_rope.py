@@ -70,7 +70,8 @@ def test_fused_rmsnorm_matches_eager_on_bf16(rows, width):
         f"max { (diff / ulp).max().item():.3f} ULP, max abs {diff.max().item()}"
     )
     assert (fused != eager).float().mean().item() <= 0.001, "too many elements moved"
-    assert torch.equal(fused.dtype, eager.dtype) and fused.shape == eager.shape
+    assert fused.dtype == eager.dtype and fused.shape == eager.shape
+
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_fused_rmsnorm_refuses_dtypes_with_unverified_reduction(dtype):
