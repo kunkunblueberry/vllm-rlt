@@ -237,6 +237,7 @@ implemented in V006; each item states the experiment that confirmed or rejected 
 | 4 | ~~Batch the GQA query group inside decode attention~~ **done in V006** | was up to 3.1x loss vs vLLM | `Nanbeige r128` 2.158 -> 0.653 | delivered 3.31x on that case; now 0.67x/0.95x/1.05x of vLLM at r8/r32/r128 | MHA did not regress; residual is kernel-launch cost, see V006 |
 | 5 | ~~Retune `NUM_SPLITS`~~ **done in V006** | was 1.20-1.6x depending on shape | split sweep 1..16 at 108 SMs; 16 was never optimal | split count is now derived from the batch shape (`_split_count`) | kept power-of-two and shape-only dependence, so CUDA graphs and batch invariance still hold |
 | 6 | Cut `tl.dot`-free single-row long-context decode | 1.3x behind flashinfer at `L8192 r1` | 0.076 vs 0.058 | small | low priority: single-row long context is not a throughput regime |
+| 7 | **Open:** a second decode path for short contexts | 1.40-1.52x behind vLLM at context <= 512, back-to-back timing | split pair 0.0838 vs vLLM 0.0559 at 512/8; a measured single-pass kernel gives 0.0323 (0.58x of vLLM) | the whole short-context gap | must choose the path on the device from `context_lengths`, because a host branch would sync or break graph capture; design and the rejected shortcuts are in `docs/experiments/V007-short-context-gqa-decode.md` |
 
 Items 2 and 3 are the real operator-level work. Item 1 is free and already measured; it
 should be resolved before any kernel rewrite, because with graphs off every operator
