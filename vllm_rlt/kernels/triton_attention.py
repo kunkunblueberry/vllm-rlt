@@ -339,6 +339,7 @@ def paged_attention(
         block_h = 1
         kernel = _paged_attention_kernel
         grid = (rows, heads, NUM_SPLITS)
+    extra = {"BLOCK_H": block_h, "BLOCK_H_DOT": block_h} if head_groups > 1 else {}
     kernel[grid](
         q,
         key_cache,
@@ -365,9 +366,8 @@ def paged_attention(
         BLOCK_T=32,
         SPLITS=NUM_SPLITS,
         WINDOW=window,
-        BLOCK_H=block_h,
-        BLOCK_H_DOT=block_h,
         num_warps=4,
+        **extra,
     )
     _paged_attention_merge_kernel[(rows, heads)](
         part_m,
