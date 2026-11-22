@@ -217,7 +217,7 @@ def _paged_attention_grouped_kernel(
             keys = keys * tl.load(KS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
             keys = keys.to(Q.dtype.element_ty)
         else:
-            keys = tl.load(key_pointers, mask=kv_mask, other=0.0)
+            keys = tl.load(key_pointers, mask=kv_mask, other=0.0).to(Q.dtype.element_ty)
         # One tile, BLOCK_H dot products: the reuse the per-head kernel loses.
         scores = tl.dot(query, tl.trans(keys)) * SCALE
         scores = tl.where(valid_tokens[None, :], scores, -float("inf"))
@@ -237,7 +237,7 @@ def _paged_attention_grouped_kernel(
             values = values * tl.load(VS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
             values = values.to(Q.dtype.element_ty)
         else:
-            values = tl.load(value_pointers, mask=kv_mask, other=0.0)
+            values = tl.load(value_pointers, mask=kv_mask, other=0.0).to(Q.dtype.element_ty)
         # tl.dot needs a power-of-two head axis; zero-pad and mask the extra rows back out.
         in_range = tl.arange(0, BLOCK_H_DOT) < BLOCK_H
         padded = tl.where(in_range[:, None], weights.to(values.dtype), 0.0)
