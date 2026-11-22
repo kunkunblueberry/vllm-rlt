@@ -263,13 +263,15 @@ def _paged_attention_grouped_kernel(
         else:
             values = tl.load(value_pointers, mask=kv_mask, other=0).to(tl.float32)
         # tl.dot needs both shapes as powers of two; zero-pad the head axis instead of
-        # rounding BLOCK_H up, which would read query heads outside the group.
-        padded = tl.zeros((BLOCK_H_DOT, BLOCK_T), dtype=weights.dtype)
-        padded = tl.where(
-            (tl.arange(0, BLOCK_H_DOT) < BLOCK_H)[:, None], weights.to(values.dtype), padded
-        )
+        # tl.dot needs both shapes as powers of two; zero-pad the head axis instead of
+        # rounding BLOCK_H up, which would read query heads outside the group. The padding
+        # rows produce zeros that the masked store below discards.
+        in_range = tl.arange(0, BLOCK_H_DOT) < BLOCK_H
+        padded = tl.where(in_range[:, None], weights.to(values.dtype), 0.0)
         partial = tl.dot(padded, values, input_precision="ieee")
-        accumulator = accumulator * correction[:, None] + partial[:BLOCK_H, :]
+        accumulator = accumulator * correction[:, None] + tl.where(
+            in_range[:, None], partial, 0.0
+        )
         normalizer = normalizer * correction + tl.sum(weights, axis=1)
         maximum = next_maximum
     # Masked heads have an empty softmax: force a finite zero instead of 0/0 = NaN. The merge
