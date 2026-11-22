@@ -19,9 +19,9 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 # (query heads, kv heads) from vllm_rlt/models/*.py
 GEOMETRIES = [
     (16, 16),  # Ouro: MHA, must keep using the per-head kernel
-    (32, 8),   # group of 4
-    (48, 8),   # Nanbeige, group of 6
-    (16, 4),   # group of 4
+    (32, 8),  # group of 4
+    (48, 8),  # Nanbeige, group of 6
+    (16, 4),  # group of 4
 ]
 
 
@@ -76,7 +76,10 @@ def test_gqa_decode_is_batch_invariant(heads, kv_heads):
     out4 = single[1][0]
     for r in range(4):
         deep = torch_paged_attention(
-            single[1][1][r : r + 1], single[1][2], single[1][3], single[1][4][r : r + 1],
+            single[1][1][r : r + 1],
+            single[1][2],
+            single[1][3],
+            single[1][4][r : r + 1],
             single[1][5][r : r + 1],
         ).float()
         assert (out4[r : r + 1] - deep).abs().max().item() <= 2e-2

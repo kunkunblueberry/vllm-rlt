@@ -187,12 +187,15 @@ def _paged_attention_group_kernel(
     VS,
     q_batch_stride,
     q_head_stride,
+    q_dim_stride,
     k_block_stride,
     k_token_stride,
     k_head_stride,
+    k_dim_stride,
     v_block_stride,
     v_token_stride,
     v_head_stride,
+    v_dim_stride,
     table_stride,
     s_block_stride,
     s_token_stride,
@@ -216,24 +219,27 @@ def _paged_attention_group_kernel(
     per-row online-softmax state and drives the tile through two `tl.dot`s. Decode needs the
     same thing with the query rows being the query heads of one KV group, so this kernel
     reuses that structure verbatim (same accumulator/correction/rescale order, same FP8
-    dequantize-then-narrow path) and only changes what a "row" is and drops the causal mask.
+    dequantize-then-narrow path) and changes only what a "row" is and drops the causal mask.
 
     It targets the measured defect of the per-head kernel: with HEAD_GROUPS query heads per
     KV head, that kernel launched HEAD_GROUPS programs which each walked the same tile, so
     instructions (and loads) were repeated per head. Here one program owns a
     [BLOCK_H, BLOCK_T] score tile, so the KV tile is loaded once and a tensor-core dot
     serves the whole group.
+
+    The program id names the KV head, not a block of query heads: a query-head block like
+    `[head_block * BLOCK_H, ...)` does not line up with KV groups when HEAD_GROUPS does not
+    divide BLOCK_H, which silently scores heads against the wrong KV head. Deriving `heads`
+    from `kv_head` makes the mapping exact by construction, and every query head then has
+    exactly one owning program, which is also what keeps the partial stores race-free.
     """
     row = tl.program_id(0)
-    head_block = tl.program_id(1)
+    kv_head = tl.program_id(1)
     split = tl.program_id(2)
-    first_head = head_block * BLOCK_H
-    heads = first_head + tl.arange(0, BLOCK_H)
-    # Heads past this KV head's group belong to the next KV head; they compute garbage that
-    # is masked at the store, so their scores are forced to -inf to keep the exponentials
-    # finite and identical to an empty softmax.
-    in_group = (tl.arange(0, BLOCK_H) < HEAD_GROUPS) & (heads < NUM_HEADS)
-    kv_head = first_head // HEAD_GROUPS
+    lane = tl.arange(0, BLOCK_H)
+    heads = kv_head * HEAD_GROUPS + lane
+    # BLOCK_H is padded up to what `tl.dot` wants, so most lanes can be outside the group.
+    in_group = (lane < HEAD_GROUPS) & (heads < NUM_HEADS)
     length = tl.load(LENGTHS + row)
     # WINDOW=0 covers the full context, matching the per-head kernel's semantics.
     covered = length if WINDOW == 0 else tl.minimum(length, WINDOW)
@@ -246,10 +252,7 @@ def _paged_attention_group_kernel(
     dims = tl.arange(0, BLOCK_D)
     dim_valid = dims < HEAD_DIM
     query = tl.load(
-        Q
-        + row * q_batch_stride
-        + heads[:, None] * q_head_stride
-        + dims[None, :],
+        Q + row * q_batch_stride + heads[:, None] * q_head_stride + dims[None, :] * q_dim_stride,
         mask=in_group[:, None] & dim_valid[None, :],
         other=0.0,
     )
@@ -272,23 +275,22 @@ def _paged_attention_group_kernel(
                 + blocks[:, None] * k_block_stride
                 + offsets[:, None] * k_token_stride
                 + kv_head * k_head_stride
-                + dims[None, :]
+                + dims[None, :] * k_dim_stride
             )
             if HAS_SCALE:
                 scale_offsets = (
                     blocks * s_block_stride + offsets * s_token_stride + kv_head * s_head_stride
                 )
-                keys = tl.where(
-                    kv_mask, tl.load(key_pointers, mask=kv_mask).to(tl.float32), 0.0
-                )
+                keys = tl.where(kv_mask, tl.load(key_pointers, mask=kv_mask).to(tl.float32), 0.0)
                 keys = keys * tl.load(KS + scale_offsets, mask=key_valid, other=0.0)[:, None]
                 keys = keys.to(Q.dtype.element_ty)
             else:
                 keys = tl.load(key_pointers, mask=kv_mask, other=0.0)
             scores = tl.dot(query, tl.trans(keys), input_precision=PRECISION) * SCALE
             # Decode has one query position per row, which sits at the end of the context, so
-            # there is no causal mask; only out-of-group heads are excluded.
-            scores = tl.where(key_valid[None, :], scores, -float("inf"))
+            # there is no causal mask; only padding lanes outside the group are excluded.
+            visible = key_valid[None, :] & in_group[:, None]
+            scores = tl.where(visible, scores, -float("inf"))
             next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
             safe = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
             correction = tl.exp(maximum - safe)
@@ -298,7 +300,7 @@ def _paged_attention_group_kernel(
                 + blocks[:, None] * v_block_stride
                 + offsets[:, None] * v_token_stride
                 + kv_head * v_head_stride
-                + dims[None, :]
+                + dims[None, :] * v_dim_stride
             )
             if HAS_SCALE:
                 values = tl.where(
@@ -313,18 +315,16 @@ def _paged_attention_group_kernel(
             accumulator = accumulator * correction[:, None] + partial
             normalizer = normalizer * correction + tl.sum(weights, axis=1)
             maximum = next_maximum
-    # A head outside the group (or a part covering no keys) yields (-inf, 0, 0), which the
-    # merge kernel already weights by zero.
     out = accumulator / tl.maximum(normalizer, 1e-30)[:, None]
+    # An empty part (or a padding lane) stores (-inf, 0, 0), which the merge weights by zero.
     maximum = tl.where(normalizer > 0, maximum, -float("inf"))
     part = (row * NUM_HEADS + heads) * SPLITS + split
-    store_mask = heads < NUM_HEADS
-    tl.store(PART_M + part, maximum, mask=store_mask)
-    tl.store(PART_L + part, normalizer, mask=store_mask)
+    tl.store(PART_M + part, maximum, mask=in_group)
+    tl.store(PART_L + part, normalizer, mask=in_group)
     tl.store(
         PART_O + part[:, None] * BLOCK_D + dims[None, :],
-        tl.where(in_group[:, None], out, 0.0),
-        mask=store_mask[:, None] & dim_valid[None, :],
+        out,
+        mask=in_group[:, None] & dim_valid[None, :],
     )
 
 
@@ -363,8 +363,9 @@ def paged_attention(
         # GQA: reuse the prefill kernel's many-rows-one-tile structure with the query heads
         # of a KV group as the rows, so the tile is loaded once per group instead of once
         # per head. MHA keeps the per-head kernel, which measures faster there.
-        block_h = min(head_groups, 16)
-        _paged_attention_group_kernel[(rows, triton.cdiv(heads, block_h), NUM_SPLITS)](
+        # tl.dot needs at least 16 rows; groups of 4 or 6 pad up and mask the extra lanes.
+        block_h = max(16, triton.next_power_of_2(min(head_groups, 16)))
+        _paged_attention_group_kernel[(rows, key_cache.shape[2], NUM_SPLITS)](
             q,
             key_cache,
             value_cache,
