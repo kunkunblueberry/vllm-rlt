@@ -22,7 +22,7 @@ class _Triple(torch.nn.Module):
         self.a = torch.nn.Linear(64, 32, bias=False)
         self.b = torch.nn.Linear(64, 16, bias=False)
         self.c = torch.nn.Linear(64, 16, bias=False)
-        self.fused = FusedInputProjections(("a", "b", "c"), self)
+        self.fused = FusedInputProjections.for_module(self, ("a", "b", "c"))
 
 
 def test_fused_weight_is_the_concatenation_in_source_order():

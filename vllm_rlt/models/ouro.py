@@ -171,7 +171,7 @@ class OuroAttention(nn.Module):
         )
         # q/k/v read the same hidden row, so one fused GEMV streams 25.2 MB instead of
         # three 8.4 MB matrices, which is where the bandwidth is (see fused_projections).
-        self.qkv_proj = FusedInputProjections(("q_proj", "k_proj", "v_proj"), self)
+        self.qkv_proj = FusedInputProjections.for_module(self, ("q_proj", "k_proj", "v_proj"))
 
     def forward(
         self,
@@ -203,7 +203,7 @@ class OuroMLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         # gate and up share the input row; one 46.1 MB GEMV instead of two 23.1 MB ones.
-        self.gate_up_proj = FusedInputProjections(("gate_proj", "up_proj"), self)
+        self.gate_up_proj = FusedInputProjections.for_module(self, ("gate_proj", "up_proj"))
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         gate, up = self.gate_up_proj(hidden).split(self.gate_proj.out_features, dim=-1)

@@ -15,17 +15,24 @@ the 40 MB L2) rises steeply with matrix size:
 
 So the cost of a projection at this size is dominated by how few bytes are in flight, not
 by arithmetic. Concatenating the matrices that share the same input turns three 8.4 MB
-GEMVs into one 25.2 MB GEMM and two 23.1 MB GEMVs into one 46.1 MB GEMM. Measured over a
-full pass of 24 layers x 4 loops of distinct weights (9.87 GB streamed): 11.92 ms -> 9.65 ms,
-i.e. 827 -> 1022 GB/s, a 1.24x speedup on the projection work alone.
+GEMVs into one 25.2 MB GEMM and two 23.1 MB GEMVs into one 46.1 MB GEMM. On the real
+Ouro-1.4B weights one 24-layer pass drops from 1.920 ms to 1.355 ms (1.42x).
 
 The fused weights are derived, not stored: the checkpoint keeps ``q_proj``/``k_proj``/
 ``v_proj`` and ``gate_proj``/``up_proj`` as separate parameters so loading stays
-byte-for-byte compatible with the published checkpoints. Each layer builds its fused view
+byte-for-byte compatible with the published checkpoints. Each holder builds its fused view
 once, on first forward, from the already-loaded parameters.
-"""
 
-import weakref
+Two constraints shaped the implementation, and both were found by tests rather than by
+inspection:
+
+* The holder must not reference its owning module. A strong reference makes the module
+  graph cyclic and ``state_dict``/``_apply`` recurse until the stack overflows; a weak
+  reference cannot be pickled, and the engine ships the model to a worker process. The
+  sources are therefore passed in as tensors at construction time.
+* The fused copy has to notice when the sources are replaced (dtype conversion, reload),
+  or it silently keeps computing with the old weights.
+"""
 
 import torch
 from torch import nn
@@ -34,30 +41,30 @@ __all__ = ["FusedInputProjections"]
 
 
 class FusedInputProjections(nn.Module):
-    """One weight matrix for several projections that share the same input.
+    """One weight matrix for projections that share the same input.
 
-    The owner is held weakly on purpose. A strong reference would make the module graph
-    cyclic (owner -> fused -> owner), and both ``state_dict`` and ``_apply`` walk that
-    graph recursively, so they would recurse until the stack overflows.
+    ``sources`` is the list of parameter names, kept for repr and diagnostics. The weights
+    themselves are supplied by the caller and are the load-bearing part.
     """
 
-    def __init__(self, sources: tuple[str, ...], owner: nn.Module) -> None:
+    def __init__(self, sources: tuple[str, ...], weights: tuple[torch.Tensor, ...]) -> None:
         super().__init__()
-        self.sources = sources
-        self._owner_ref = weakref.ref(owner)
+        self.sources = tuple(sources)
+        if len(sources) != len(weights):
+            raise ValueError("every source needs one weight")
+        self._sources = tuple(weights)
         self._fused: nn.Parameter | None = None
         self._signature: tuple | None = None
 
-    @property
-    def _owner(self) -> nn.Module:
-        owner = self._owner_ref()
-        if owner is None:
-            raise RuntimeError("the owning module was released")
-        return owner
+    @classmethod
+    def for_module(cls, module: nn.Module, sources: tuple[str, ...]) -> "FusedInputProjections":
+        """Build from a module that owns ``sources`` as ``nn.Linear`` attributes.
 
-    def _sources(self) -> list[torch.Tensor]:
-        owner = self._owner
-        return [getattr(owner, name).weight for name in self.sources]
+        The weights are captured immediately, so the fused holder carries no reference
+        back to ``module`` and stays picklable for the engine's worker process.
+        """
+        weights = tuple(getattr(module, name).weight for name in sources)
+        return cls(sources, weights)
 
     def weight(self) -> torch.Tensor:
         """Return the fused weight, rebuilding it if the sources were replaced.
@@ -66,10 +73,13 @@ class FusedInputProjections(nn.Module):
         reload: both replace the source parameters, and a stale fused copy would silently
         compute with the old weights.
         """
-        parts = self._sources()
-        signature = tuple((id(p), p.data_ptr(), p.dtype, tuple(p.shape)) for p in parts)
+        signature = tuple(
+            (id(p), p.data_ptr(), p.dtype, tuple(p.shape)) for p in self._sources
+        )
         if self._fused is None or self._signature != signature:
-            self._fused = nn.Parameter(torch.cat(parts, dim=0), requires_grad=False)
+            self._fused = nn.Parameter(
+                torch.cat(list(self._sources), dim=0), requires_grad=False
+            )
             self._signature = signature
         return self._fused
 
