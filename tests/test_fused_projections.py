@@ -55,12 +55,11 @@ def test_fused_weight_rebuilds_after_parameter_replacement():
     second = layer.fused.weight()
     assert second.data_ptr() != first.data_ptr()
     assert torch.equal(second[:32], layer.a.weight)
-
     layer.half()
     third = layer.fused.weight()
     assert third.dtype == torch.float16
+    # _apply converts in place, so the signature only changes via dtype here.
     assert torch.equal(third[32:], layer.b.weight)
-
 
 def test_state_dict_is_unchanged_by_fusion():
     """The fused matrices are derived, so they must not appear as checkpoint keys."""
