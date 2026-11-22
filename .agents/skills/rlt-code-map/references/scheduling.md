@@ -81,9 +81,9 @@ order waiting ─► active-slot check ─► resume-or-allocate ─► enter ph
   `mode="mixed"` (producing tokens) or `wavefront_chunked_prefill`. Staged prefill
   splits a prompt into `PREFILLING_PRELUDE` (embeddings) and
   `PREFILLING_RECURRENT` (per-depth recurrence) so recurrent decode work can join.
-- Per-depth frontier: `Request.prefill_boundaries` / `prefill_depth_ranges`
-  (`vllm_rlt/request.py:87`), advanced by `_apply_split_prefill_progress`
-  (`core/scheduler.py:980`) and friends (`:1049`, `:1077`, `:1177`).
+- Per-depth frontier: `Request.prefill_boundaries` (`vllm_rlt/request.py:87`) fills the
+  `prefill_depth_ranges` field (`vllm_rlt/request.py:54`); advanced by
+  `_apply_split_prefill_progress` (`core/scheduler.py:980`) and friends (`:1049`, `:1077`, `:1177`).
 - Wavefront: `_take_wavefront_phase` (`:859`) round-robins chunks across requests
   and depths inside one token budget; it needs `last_exited` KV
   (`engine/stage_engine.py:210-211`). Design intent:
@@ -103,9 +103,9 @@ order waiting ─► active-slot check ─► resume-or-allocate ─► enter ph
 | speculation | `SpeculativePolicy` `:128` | coda → speculative round → admit → prompt phases |
 | `produces_tokens=False` (PD prefill stage) | `PromptOnlyPolicy` `:39` | admit + prompt phases only |
 
-`prefer_recurrent=True` is set by `StageEngine._step_async`
-(`engine/stage_engine.py:942`) when the previous core is still in flight, so an
-independent boundary op can overlap instead of fragmenting the batch.
+`prefer_recurrent=True` is set inside `StageEngine._step_async`
+(`engine/stage_engine.py:934`, argument at `:942`) when the previous core is still
+in flight, so an independent boundary op can overlap instead of fragmenting the batch.
 
 ## Exit policies
 

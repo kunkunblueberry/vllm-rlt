@@ -15,9 +15,8 @@ Console scripts (`pyproject.toml:33-35`):
 
 Library entry points: `LLM` (`vllm_rlt/entrypoints/llm.py:14`), `StageClient`
 (`vllm_rlt/engine/llm_engine.py:19`), `PDEngine` (`vllm_rlt/pd/engine.py:54`).
-Shared CLI → config translation: `add_runtime_args` / `runtime_configs`
-(`vllm_rlt/entrypoints/runtime_args.py:12`, `:103`), profiling flags
-`:151`/`:173`.
+Shared CLI → config translation: `add_runtime_args` (`vllm_rlt/entrypoints/runtime_args.py:12`)
+and `runtime_configs` (`:103`); profiling flags `add_profile_args`/`profile_config_from_args` (`:151`/`:173`).
 
 ## One local stage: object graph
 
@@ -57,13 +56,13 @@ Parent → child (`StageClient.send`, `vllm_rlt/engine/llm_engine.py:103`); hand
 
 | kind | sent at | handled at |
 | --- | --- | --- |
-| `control` | `llm_engine.py:168` | `worker.py:96` (method table `:98-106`) |
-| `add` | `llm_engine.py:213` | `worker.py:156` |
-| `abort` | `llm_engine.py:237` | `worker.py:163` |
-| `shutdown` / `stop` | `llm_engine.py:283` | `worker.py:147` / `:165` |
-| PD kinds `connect/reserve/prefill/cancel/cancel_safe/commit/ack` | `pd/engine.py` (see below) | routed to the connector first, `worker.py:154` → `pd/connector.py:104` |
+| `control` | `engine/llm_engine.py:168` | `engine/worker.py:96` (method table `:98-106`) |
+| `add` | `engine/llm_engine.py:213` | `engine/worker.py:156` |
+| `abort` | `engine/llm_engine.py:237` | `engine/worker.py:163` |
+| `shutdown` / `stop` | `engine/llm_engine.py:283` | `engine/worker.py:147` / `:165` |
+| PD kinds `connect/reserve/prefill/cancel/cancel_safe/commit/ack` | `pd/engine.py` (see below) | routed to the connector first (`engine/worker.py:154`) → `PDStageConnector.command` (`pd/connector.py:104`) |
 
-Child → parent (`StageWorker.send` `worker.py:91`): `ready` (`:89`), `reply`
+Child → parent (`StageWorker.send`, `vllm_rlt/engine/worker.py:91`): `ready` (`:89`), `reply`
 (`:135`/`:143`), `output` (`:174`), `stopped` (`:204`), `fatal` (`:233`),
 `connected` (`pd/connector.py:110`).
 
@@ -85,7 +84,7 @@ One request, in order:
 1. `PDEngine.add_request` (`pd/engine.py:276`) → `Pending` (`:331`) →
    `_admit` (`:335`) selects one P and one D peer by credit (`:350-367`) and sends
    `reserve` to **D** (`:384`).
-2. D: `PDStageConnector.command` `reserve` (`pd/connector.py:104`, `receiving=True`)
+2. D: `PDStageConnector.command` (`pd/connector.py:104`) receives `reserve` with `receiving=True`
    → `StageEngine.reserve_transfer` (`engine/stage_engine.py:679`): `_add_request`
    (`:689`), `Scheduler.reserve_transfer` (`core/scheduler.py:422`), phase
    `RECEIVING` (`engine/stage_engine.py:707-709`) → notify `reserved`
@@ -130,8 +129,8 @@ must not recycle pages while the source may still write.
   (`:146`): tokenize (`:157`), resolve params (`:158`), `engine.add_request`
   (`:164`), `engine.step()` (`:170`), incremental decode (`:177-181`), then
   `TokenEvent` (`:192-197`) appended on the loop side (`:253-254`).
-- SSE: stream prepared once (`server.py:110-117`), `completion`/`sse`
-  (`protocol.py:200`/`:215`) written under `write_timeout` (`server.py:126`),
+- SSE: stream prepared once (`server.py:110-117`), `completion` (`serving/protocol.py:200`)
+  and `sse` (`:215`) written under `write_timeout` (`server.py:126`),
   `[DONE]` at `:156`. Errors before the first token become an HTTP status
   (`:163`); after it they abort the transport (`:168`).
 - The engine thread is the only place that may touch the engine, tokenizer or
