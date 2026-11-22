@@ -80,8 +80,8 @@ synchronous one is the reference reading order.
    (snapshot positions/depths, choose static workspace, or
    `AsyncState.prepare` `worker/async_state.py:203`, or
    `MetadataBuilder.build` `worker/metadata.py:172`).
-5. **Device prepare** — `prepare_on_gpu` `:972` (UVA/pinned upload, packed
-   metadata expansion, `_prepare_forward` `:1011` binds device views).
+5. **Device prepare** — `prepare_on_gpu` (`worker/model_runner.py:972`): UVA/pinned
+   upload, packed metadata expansion, `_prepare_forward` (`:1011`) binds device views.
 6. **Execute** — `_execute_batch` `:1124` → `ModelRuntime.forward`
    `worker/executor.py:172` → model `*_prepared` → per layer
    `KVCacheManager._write_prepared` `core/kv_cache_manager.py:848` then
@@ -167,7 +167,7 @@ begin ─► prepare_on_cpu ─► prepare_on_gpu ─► execute ─► compute_
 - Slot/rotation: `SubmissionQueue.begin/complete/drain`
   `worker/submission_queue.py:26/40/44`; readback leases `_readback_slot`
   `worker/model_runner.py:1170`; results are host copies plus borrowed
-  `ExecutionBatch` (`worker/output.py:31`).
+  `ExecutionBatch`; the result struct is `ModelRunnerOutput` (`worker/output.py:31`).
 - Per-request completion event: `model_runner.events[request_id]`
   (`worker/model_runner.py:1284`); consumed by scheduler progress checks
   (`request_events=` on `update_from_output`/`update_after_submission`) and by
@@ -202,8 +202,9 @@ begin ─► prepare_on_cpu ─► prepare_on_gpu ─► execute ─► compute_
    (`worker/executor.py:41-47`).
 7. **Backends declare capabilities; callers read them.** Route on
    `BackendCapabilities` (`attention/backend.py:18`), never on a version string.
-8. **Test-only adapters are not the hot path.** `KVCacheManager.write` `:827`
-   and `attend` `:954` rebuild a descriptor per call and are used by tests only;
+8. **Test-only adapters are not the hot path.** `KVCacheManager.write`
+   (`core/kv_cache_manager.py:827`) and `attend` (`:954`) rebuild a descriptor per
+   call and are used by tests only;
    production goes through `_write_prepared`/`_attend_prepared`. Optimizing or
    reading `write()` as if it were the engine path is a false lead.
 9. **Async paths keep their own invariants.** In async scheduling the CPU
