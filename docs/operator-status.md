@@ -72,8 +72,8 @@ Compared against vLLM `0.33.0` (`vllm/v1/attention/ops/*`, `csrc/*`).
 | RMSNorm | single native kernel incl. fused-add variants (`csrc/layernorm_kernels.cu`) | four eager PyTorch ops: `.float()`, `square().mean()`, `rsqrt`, cast, multiply | **8 kernels, ~11x slower, flat in token count** |
 | RoPE apply | one native kernel, `cos_sin_cache` lookup inside (`csrc/pos_encoding_kernels.cu`) | 7 kernels to build cos/sin + 10 more to apply (`chunk`, `cat`, `neg`, multiply, add) | **17 kernels, ~7x slower** |
 | SiLU-and-Mul | native, one kernel | native (`csrc/activation/silu_and_mul.cu`), one kernel | parity in kernel count; **3x slower** at 1-128 tokens because the dispatch entry does more host work |
-| decode attention (MHA) | `decode_attention_fwd` (legacy, split-K + reducev) and `unified_attention` (production) | own split-KV + merge, `NUM_SPLITS=16` | **rlt is fastest** at every measured MHA point |
-| decode attention (GQA) | `unified_attention` keeps the KV tile resident across the query group | rlt re-reads K/V once per query head (`kv_head = head // HEAD_GROUPS`) | **rlt 2.2x slower at rows=32, 1.9x at rows=8**; rlt still wins at rows=1 |
+| decode attention (MHA) | `decode_attention_fwd` (legacy, split-K + reducev) and `unified_attention` (production) | own per-head split-KV + merge; split count derived from the batch shape (`_split_count`) | **rlt is fastest or at parity** at every measured MHA point (0.83x-1.05x of vLLM) |
+| decode attention (GQA) | `unified_attention` keeps the KV tile resident across the query group; `triton_decode_attention` batches `BLOCK_H` query heads per KV head | `_paged_attention_group_kernel` reuses `_paged_prefill_kernel`'s many-rows-one-tile structure with one program per **KV head** | **gap closed**: 3.31x faster than before at rows=128, now 0.67x/0.95x/1.05x of vLLM at rows 8/32/128 (see `docs/experiments/V006-gqa-decode-grouped-reuse.md`) |
 | packed prefill | `unified_attention` with `tl.dot` tiles, tensor descriptors, optional 3D split | own packed kernel, `BLOCK_M/BLOCK_N=64`, `tl.dot` + optional rounding compensation | **rlt 1.2-1.5x faster**; both are prefill-only cost |
 | KV write | `triton_reshape_and_cache_flash` (Triton fallback) / native `reshape_and_cache_flash` | `masked_kv_store` / `write_graph_kv` | **rlt ~2x faster** than vLLM's Triton variant; all are launch-bound |
 | quantized KV | MXFP4/FP8 per-tensor and per-token-head paths, native | FP8 e4m3 per-vector only, fused Triton writer | narrower coverage, no measured disadvantage on the paths that exist |
@@ -82,10 +82,11 @@ Compared against vLLM `0.33.0` (`vllm/v1/attention/ops/*`, `csrc/*`).
 Two structural differences are worth stating separately because they change what an
 optimization can even achieve:
 
-- **No `tl.dot` in decode.** vLLM's `unified_attention` uses tensor-core dots for the
-  query tile; rlt's decode kernel computes `tl.sum(keys * query)` per split. At
-  `head_dim=128` and one query row this is the right call for MHA (measured faster), but it
-  is exactly why GQA at larger batch loses: there is no batching of the query group.
+- **No `tl.dot` in the per-head decode kernel.** vLLM's `unified_attention` uses tensor-core
+  dots for the query tile; rlt's per-head decode kernel computes `tl.sum(keys * query)` per
+  split. At `head_dim=128` and one query row this is the right call for MHA (measured
+  faster), which is why GQA now goes through the separate grouped kernel that does use
+  `tl.dot` over the whole query group.
 - **Host-side launch dominance.** vLLM ships fused native replacements for the elementwise
   ops precisely because their per-call work is below the launch cost. rlt keeps them in
   eager PyTorch, so the cost scales with *kernel count*, not with tokens.
@@ -135,19 +136,24 @@ split-KV + merge pair collapses from 0.066 ms to 0.010 ms at `L512 r1`.
 
 ### Decode attention, GQA (registered in the model configs)
 
-| geometry | case | rlt | vLLM unified | flashinfer |
-| --- | --- | --- | --- | --- |
-| Nanbeige 48q/8kv | L2048 r1 | **0.067** | 0.085 | 0.023 |
-| Nanbeige 48q/8kv | L2048 r8 | 0.146 | **0.117** | 0.059 |
-| Nanbeige 48q/8kv | L2048 r32 | 0.553 | **0.178** | 0.188 |
-| GQA 32q/8kv | L2048 r32 | 0.371 | **0.170** | 0.188 |
-| GQA 32q/8kv | L8192 r32 | 1.393 | **0.645** | 0.713 |
-| Dory 16q/4kv hd256 | L2048 r8 | **0.089** | 0.146 | n/m |
+Before V006 (the per-head kernel, `NUM_SPLITS=16`), the gap was up to 3.1x. After moving GQA
+onto the grouped kernel that reuses the paged-prefill structure:
 
-This is the one attention regime where rlt loses badly, up to **3.1x at
-`Nanbeige L2048 r32`**. The cause is structural, not tuning: `HEAD_GROUPS` query heads
-each run their own program and re-read the same KV tile, while `unified_attention` loads
-the tile once for the whole query group.
+| geometry | case | before | after | vLLM unified |
+| --- | --- | --- | --- | --- |
+| Nanbeige 48q/8kv | L2048 r8 | 0.173 | **0.080** | 0.119 |
+| Nanbeige 48q/8kv | L2048 r32 | 0.544 | **0.172** | 0.180 |
+| Nanbeige 48q/8kv | L2048 r128 | 2.158 | **0.653** | 0.621 |
+| GQA 32q/8kv | L2048 r32 | 0.544 | **0.171** | 0.172 |
+| GQA 32q/8kv | L2048 r128 | 2.158 | **0.650** | 0.640 |
+
+The gap is closed at r8/r32 and down to 1.05x at r128, where vLLM's `unified_attention` needs
+no merge pass at all. The residual is a kernel-launch cost, not redundant work: stage 1 alone
+measures 0.98-0.99x of vLLM's stage 1. At short context (512) the operator stays 1.23-1.37x
+behind for the same launch reason; `docs/experiments/V006-gqa-decode-grouped-reuse.md` records
+both the phase attribution and the two candidate closures that were measured and rejected.
+The `flashinfer` column this table used to carry is dropped: flashinfer is not installed on
+`lyx`, so those numbers could not be re-measured and are no longer comparable.
 
 ### Packed prefill (MHA, head_dim 128)
 
@@ -220,16 +226,16 @@ modules are.
 
 ## Optimization priority
 
-Ordered by measured cost on the real decode path, then by risk. Nothing here is
-implemented yet; each item states the experiment that would confirm or reject it.
+Ordered by measured cost on the real decode path, then by risk. Items 4 and 5 were
+implemented in V006; each item states the experiment that confirmed or rejected it.
 
 | # | target | measured cost | evidence | expected gain | risk |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Keep CUDA graphs on by default, or make the default workload work under them | 3.3x end-to-end (79.8 -> 24.0 ms/step) | A/B on the real checkpoint, 3 reps | 3.3x | config-only; must confirm graph coverage for all supported schedules |
 | 2 | Fuse RMSNorm (fp32 reduce + scale + weight) into one kernel | 2.65 ms/step (12.1%) + part of the 5.01 ms elementwise tail | 8 kernels vs 1; 11x slower at every token count; flat in tokens | 2.0-2.4 ms/step, ~9% | numerically sensitive: vLLM's fused kernel differs from the current FP64-verified reference by up to 6.3e-2 on BF16, so a fused kernel must keep the existing FP32 accumulation order |
 | 3 | Fuse RoPE table build + apply | 1.23 ms/step rotate_half + part of the elementwise/copy tail, 17 kernels | 7x slower; `cos`/`sin` only 4 launches/step but `neg`/`cat` are 396 | 0.9-1.2 ms/step, ~5% | must keep FP32 angle computation; the module already forces this deliberately |
-| 4 | Batch the GQA query group inside decode attention | up to 3.1x loss vs vLLM in GQA | `Nanbeige r32` 0.553 vs 0.178 | 0.1-0.37 ms/step for GQA models only | kernel rewrite; MHA must not regress, and MHA is where rlt currently wins |
-| 5 | Retune `NUM_SPLITS` for long context | at `L8192 r8`: splits 16 -> 32 gives 1.10x (0.200 -> 0.182 ms device); full sweep 0.854 / 0.457 / 0.254 / 0.249 / 0.200 / 0.182 / 0.183 for splits 1/2/4/8/16/32/64 | split sweep 1..64 at L512/L2048/L8192 | ~0.02 ms/step at long context | accuracy unchanged (err 3e-5..1e-4 across all splits); the win is real but small, so this is a policy tweak, not a rewrite |
+| 4 | ~~Batch the GQA query group inside decode attention~~ **done in V006** | was up to 3.1x loss vs vLLM | `Nanbeige r128` 2.158 -> 0.653 | delivered 3.31x on that case; now 0.67x/0.95x/1.05x of vLLM at r8/r32/r128 | MHA did not regress; residual is kernel-launch cost, see V006 |
+| 5 | ~~Retune `NUM_SPLITS`~~ **done in V006** | was 1.20-1.6x depending on shape | split sweep 1..16 at 108 SMs; 16 was never optimal | split count is now derived from the batch shape (`_split_count`) | kept power-of-two and shape-only dependence, so CUDA graphs and batch invariance still hold |
 | 6 | Cut `tl.dot`-free single-row long-context decode | 1.3x behind flashinfer at `L8192 r1` | 0.076 vs 0.058 | small | low priority: single-row long context is not a throughput regime |
 
 Items 2 and 3 are the real operator-level work. Item 1 is free and already measured; it
