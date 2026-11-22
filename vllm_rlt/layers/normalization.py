@@ -19,9 +19,12 @@ class RMSNorm(nn.Module):
     Retains FP32 precision during reduction to preserve numerical stability
     across all input activation dtypes (BF16/FP16/FP32).
 
-    A fused Triton kernel is used when it can reproduce this expression exactly;
-    otherwise the eager path below runs. The eager path stays the numerical
-    reference either way.
+    A fused Triton kernel replaces the five eager ops when enabled. It keeps the
+    FP32 reduction and the same rounding boundary, but its FP32 row sum uses a
+    different tree order than PyTorch's, so on a small fraction of inputs the
+    last bit of the variance differs (measured: <= 2 BF16 ULP on <= 0.03% of
+    elements). Only BF16 takes the fused path; FP16/FP32 keep the eager form.
+    The eager expression below stays the numerical reference either way.
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:

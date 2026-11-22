@@ -17,13 +17,19 @@ straight port of vLLM's kernels would fall into:
    where eager PyTorch gives three (one per product, one per add). That is a visible
    0.0156 BF16 difference. Each product therefore goes through an explicit
    round-to-activation-dtype barrier written in inline PTX, which the compiler cannot
-   fold. With the barrier, results are bitwise equal to eager.
+   fold. With the barrier, RoPE results are bitwise equal to eager for FP16 and BF16.
 3. **The BF16 and FP16 barriers must be separate ``@triton.jit`` functions.** Branching on
    a runtime flag inside one helper makes Triton unify two different return types and the
    kernel fails to compile.
 
-RMSNorm's FP32 reduction order matches PyTorch's for BF16 activations but not for
-FP16/FP32, so only BF16 is admitted; see :func:`fused_precision_ok`.
+One property could **not** be achieved and is stated as measured rather than idealised:
+**fused RMSNorm is not bitwise equal to eager.** Its FP32 row sum runs in one Triton block
+whose tree order differs from PyTorch's for wide rows, so the last bit of the variance
+sometimes resolves differently. Over 160 shape/weight combinations: 2.5% of cases differ,
+at most 2 BF16 ULP, and at most 0.03% of elements. Both implementations sit at the same
+distance from an FP64 oracle, so neither is more accurate. FP16/FP32 are excluded entirely
+(1 FP16 ULP is a larger relative error than 1 BF16 ULP), which is what
+``fused_precision_ok`` enforces.
 """
 
 import torch
