@@ -299,3 +299,43 @@ def test_dtype_conversion_preserves_float32_rotary_frequencies(model):
     angles = torch.cat([angles, angles], dim=-1)
     torch.testing.assert_close(cos[:, 0], angles.cos().bfloat16(), atol=0, rtol=0)
     torch.testing.assert_close(sin[:, 0], angles.sin().bfloat16(), atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+def test_fused_norm_rope_preserves_layer_output():
+    """Enabling the fused path must not move the decoder layer's output.
+
+    RMSNorm's FP32 tree order can differ from PyTorch's in the last bit (see
+    tests/test_fused_norm_rope.py), so this compares the *layer* result with a tight
+    relative bound rather than bitwise equality: one ULP in a normalized activation is
+    far below the projection's own BF16 rounding.
+    """
+    import vllm_rlt.layers.normalization as normalization
+    import vllm_rlt.layers.rotary_embedding as rotary_embedding
+
+    torch.manual_seed(73)
+    hidden_size, rows = 64, 5
+    norm = normalization.RMSNorm(hidden_size, eps=1e-6).to("cuda", torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(hidden_size))
+    hidden = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    eager = norm(hidden)
+    norm._fused = True
+    fused = norm(hidden)
+    torch.testing.assert_close(fused, eager, rtol=1e-2, atol=1e-3)
+
+    rope = rotary_embedding.RotaryEmbedding(head_dim=128, rope_theta=1e6).to(
+        "cuda", torch.bfloat16
+    )
+    q = torch.randn(rows, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(rows, 16, 128, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int64)
+    cos, sin = rope(q, positions)
+    eager_q, eager_k = rotary_embedding.apply_rotary_pos_emb(q, k, cos, sin)
+    from vllm_rlt.kernels.fused_norm_rope import fused_rotary_apply
+
+    fused_q, fused_k = fused_rotary_apply(q, k, cos, sin)
+    # RoPE is bitwise exact, so this one may be an equality assertion.
+    assert torch.equal(fused_q, eager_q)
+    assert torch.equal(fused_k, eager_k)
