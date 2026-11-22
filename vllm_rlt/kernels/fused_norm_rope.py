@@ -1,45 +1,75 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused RMSNorm and RoPE kernels that preserve the eager rounding boundaries.
+"""Fused RMSNorm and split-half RoPE kernels.
 
-Both kernels exist to remove kernel launches, not to change arithmetic. The eager
-PyTorch expressions they replace are the numerical reference and the repository's
-precision policy pins their rounding:
+These kernels exist to remove kernel launches. They are not allowed to change
+arithmetic: the eager PyTorch expressions in ``vllm_rlt/layers`` are the numerical
+reference, and ``docs/precision-policy.md`` pins their rounding (FP32 variance for
+RMSNorm, FP32 frequencies and phase for RoPE).
 
-* RMSNorm retains FP32 variance/reduction and returns to the activation dtype at the
-  normalized-value boundary, then multiplies by the weight in that dtype. The fused
-  kernel therefore rounds the normalized value to the activation dtype and only then
-  applies the weight, which is exactly one BF16/FP16 rounding per element.
-* RoPE retains FP32 frequencies and phase, and applies the positional factors in the
-  activation dtype, matching ``q * cos + rotate_half(q) * sin`` elementwise.
+Two findings from building them are worth recording, because both are traps that a
+straight port of vLLM's kernels would fall into:
 
-Because the fused kernels only reorder independent element operations, their outputs are
-bitwise identical to the eager path; ``tests/test_fused_norm_rope.py`` asserts that with
-``torch.equal`` rather than a tolerance. Anything wider than one row for RMSNorm or a GQA
-group for RoPE falls back to eager rather than trading semantics for launches.
+1. **vLLM's RoPE pairs interleaved dimensions** (``IS_NEOX=false`` is its default), while
+   every model here uses the split-half ``rotate_half`` layout. Using vLLM's default
+   pairing produces a completely different rotation (measured |diff| ~7.9 on random
+   inputs), not a rounding difference.
+2. **Triton contracts ``a*b + c*d`` into a single FP32 multiply-add**, giving one rounding
+   where eager PyTorch gives three (one per product, one per add). That is a visible
+   0.0156 BF16 difference. The kernel therefore forces each product through an explicit
+   round-to-activation-dtype barrier. With the barrier, results are bitwise equal to eager.
+
+RMSNorm's FP32 reduction order still differs from PyTorch's for FP16/FP32 inputs, so those
+two dtypes only take the fused path when a verified kernel exists for them; see
+``fused_rmsnorm`` and the parity tests for the exact scope.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-__all__ = ["fuse_norm_rope", "fused_rmsnorm", "fused_rope", "rotate_half_reference"]
+__all__ = [
+    "fuse_norm_rope",
+    "fused_precision_ok",
+    "fused_rmsnorm",
+    "fused_rotary_apply",
+]
 
 
 def fuse_norm_rope() -> bool:
     """Whether the fused kernels are enabled for this process.
 
-    Opt-in: the eager path stays the default until the fused kernels have hardware
-    validation on the deployment target. Set ``VLLM_RLT_FUSE_NORM_ROPE=1`` to enable.
+    Opt-in while the fused path accumulates hardware evidence:
+    ``VLLM_RLT_FUSE_NORM_ROPE=1`` enables it. The eager path is the default.
     """
     import os
 
     return os.environ.get("VLLM_RLT_FUSE_NORM_ROPE", "0") == "1"
 
 
-def rotate_half_reference(value: torch.Tensor) -> torch.Tensor:
-    """Reference rotate-half, kept here so the kernel and its test share one definition."""
-    first, second = value.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
+def fused_precision_ok(dtype: torch.dtype) -> bool:
+    """Which activation dtypes the fused RMSNorm can match bitwise.
+
+    The FP32 reduction uses a fixed tree order that matches PyTorch's for BF16 activations
+    but not for FP16/FP32 (measured: 1 FP16 ULP, 2e-6 FP32). Only BF16 is admitted, so the
+    fused path never silently changes a result. FP16/FP32 keep the eager expression.
+    """
+    return dtype is torch.bfloat16
+
+
+@triton.jit
+def _round_to_activation(X, IS_F16: tl.constexpr):
+    """Round FP32 to the activation dtype as a compiler barrier.
+
+    A plain ``.to(dtype)`` is folded into the following FMA, which is exactly the
+    one-rounding vs three-rounding mismatch this kernel must avoid.
+    """
+    if IS_F16:
+        return tl.inline_asm_elementwise(
+            "cvt.rn.f16.f32 $0, $1;", "=h,r", [X], dtype=tl.float16, is_pure=True, pack=1
+        )
+    return tl.inline_asm_elementwise(
+        "cvt.rn.bf16.f32 $0, $1;", "=h,r", [X], dtype=tl.bfloat16, is_pure=True, pack=1
+    )
 
 
 @triton.jit
@@ -51,74 +81,66 @@ def _rmsnorm_kernel(
     N: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """One program per row: FP32 variance, FP32 rsqrt, round, then weight in input dtype."""
+    """One program per row: FP32 variance and rsqrt, then round, then weight in dtype."""
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
     offsets = row * N + cols
-    # Widen once and keep the reduction in FP32, as the eager reference does.
     x = tl.load(X + offsets, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(x * x, axis=0) / N
-    scale = tl.rsqrt(variance + EPS)
     # Round the normalized value back to the activation dtype BEFORE the weight multiply.
-    # This is the eager boundary; folding it into FP32 would give a different result.
-    normalized = (x * scale).to(OUT.dtype.element_ty)
+    # Folding this into FP32 would move the rounding boundary and change the result.
+    normalized = (x * tl.rsqrt(variance + EPS)).to(OUT.dtype.element_ty)
     weight = tl.load(W + cols, mask=mask, other=0.0).to(OUT.dtype.element_ty)
     tl.store(OUT + offsets, normalized * weight, mask=mask)
 
 
 @triton.jit
-def _rope_kernel(
+def _rotary_apply_kernel(
     Q,
     K,
-    TABLES,
-    POSITIONS,
+    COS,
+    SIN,
     OUT_Q,
     OUT_K,
-    ROWS: tl.constexpr,
     HEADS: tl.constexpr,
     GROUPS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    MAX_POS: tl.constexpr,
+    IS_F16: tl.constexpr,
 ):
-    """One program per row: build cos/sin in FP32 once, apply to every head in dtype.
+    """Apply precomputed cos/sin to q and k in place of ``rotate_half`` broadcasts.
 
-    The eager path materialises ``[rows, 1, head_dim]`` cos/sin and broadcasts them over
-    the heads. Building them per row here performs the same FP32 trigonometry once per
-    row instead of once per launch, and applies the same dtype-order products.
+    ``cos``/``sin`` stay an input: the layer builds one table per decode step and every
+    layer reuses it, so building them here would move work rather than remove it.
     """
     row = tl.program_id(0)
     half = HEAD_DIM // 2
     dims = tl.arange(0, BLOCK_D)
     valid = dims < HEAD_DIM
-    # FP32 phase everywhere, matching the eager autocast-disabled computation.
-    freq_dims = tl.arange(0, BLOCK_D)
-    inv = tl.load(TABLES + freq_dims, mask=freq_dims < half, other=0.0).to(tl.float32)
-    position = tl.load(POSITIONS + row).to(tl.float32)
-    angle = position * inv
-    # The eager path concatenates [angles, angles] then takes cos/sin, so both halves of
-    # the head dimension share the same phase for the same frequency index.
-    phase = tl.where(dims < half, angle, angle)
-    cos = tl.cos(phase).to(OUT_Q.dtype.element_ty)
-    sin = tl.sin(phase).to(OUT_Q.dtype.element_ty)
+    # rotate_half pairs element i with i +/- half and negates the first half's partner.
+    partner = tl.where(dims < half, dims + half, dims - half)
+    cos = tl.load(COS + row * HEAD_DIM + dims, mask=valid, other=0.0)
+    sin = tl.load(SIN + row * HEAD_DIM + dims, mask=valid, other=0.0)
 
     for head in range(HEADS):
         base = row * HEADS * HEAD_DIM + head * HEAD_DIM
         q = tl.load(Q + base + dims, mask=valid, other=0.0)
-        # rotate_half pairs element i with element i + half; gather that partner.
-        partner_idx = tl.where(dims < half, dims + half, dims - half)
-        partner = tl.load(Q + base + partner_idx, mask=valid, other=0.0)
-        # rotate_half negates the first half's partner and passes the second half through.
-        rotated = tl.where(dims < half, -partner, partner)
-        tl.store(OUT_Q + base + dims, q * cos + rotated * sin, mask=valid)
+        q_partner = tl.load(Q + base + partner, mask=valid, other=0.0)
+        rotated = tl.where(dims < half, -q_partner, q_partner)
+        # Two separately rounded products, then the add: eager's three roundings.
+        q1 = _round_to_activation((q * cos).to(tl.float32), IS_F16)
+        q2 = _round_to_activation((rotated * sin).to(tl.float32), IS_F16)
+        tl.store(OUT_Q + base + dims, q1 + q2, mask=valid)
 
         if head < GROUPS:
             kbase = row * GROUPS * HEAD_DIM + head * HEAD_DIM
             k = tl.load(K + kbase + dims, mask=valid, other=0.0)
-            kpartner = tl.load(K + kbase + partner_idx, mask=valid, other=0.0)
-            krotated = tl.where(dims < half, -kpartner, kpartner)
-            tl.store(OUT_K + kbase + dims, k * cos + krotated * sin, mask=valid)
+            k_partner = tl.load(K + kbase + partner, mask=valid, other=0.0)
+            k_rotated = tl.where(dims < half, -k_partner, k_partner)
+            k1 = _round_to_activation((k * cos).to(tl.float32), IS_F16)
+            k2 = _round_to_activation((k_rotated * sin).to(tl.float32), IS_F16)
+            tl.store(OUT_K + kbase + dims, k1 + k2, mask=valid)
 
 
 def fused_rmsnorm(
@@ -127,7 +149,13 @@ def fused_rmsnorm(
     eps: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fused RMSNorm over the last dimension. Contiguous FP16/BF16/FP32 rows only."""
+    """Fused RMSNorm over the last dimension.
+
+    Callers must check :func:`fused_precision_ok`; this entry point raises rather than
+    silently producing a different rounding for an unsupported dtype.
+    """
+    if not fused_precision_ok(hidden.dtype):
+        raise ValueError(f"fused RMSNorm has no verified reduction for {hidden.dtype}")
     if hidden.dim() < 2 or hidden.shape[-1] > 8192:
         raise ValueError("fused RMSNorm expects 2-D rows with hidden_size <= 8192")
     if not hidden.is_contiguous():
@@ -150,38 +178,44 @@ def fused_rmsnorm(
     return out
 
 
-def fused_rope(
+def fused_rotary_apply(
     q: torch.Tensor,
     k: torch.Tensor,
-    positions: torch.Tensor,
-    inv_freq: torch.Tensor,
-    out_q: torch.Tensor,
-    out_k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    out_q: torch.Tensor | None = None,
+    out_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused split-half RoPE over contiguous ``[rows, heads, head_dim]`` tensors."""
+    """Apply RoPE to ``[rows, heads, head_dim]`` q/k using ``[rows, 1, head_dim]`` cos/sin."""
     if q.dim() != 3 or k.dim() != 3:
         raise ValueError("fused RoPE expects [rows, heads, head_dim] tensors")
     if not (q.is_contiguous() and k.is_contiguous()):
         raise ValueError("fused RoPE requires contiguous q/k")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("fused RoPE supports float16 and bfloat16 activations")
     rows, heads, head_dim = q.shape
     groups = k.shape[1]
-    if head_dim % 2 or head_dim not in (64, 128, 256):
+    if head_dim not in (64, 128, 256):
         raise ValueError("fused RoPE supports head_dim 64/128/256")
-    block = triton.next_power_of_2(head_dim)
-    _rope_kernel[(rows,)](
+    if cos.shape[0] != rows or cos.shape[-1] != head_dim:
+        raise ValueError("fused RoPE needs cos/sin shaped [rows, 1, head_dim]")
+    if out_q is None:
+        out_q = torch.empty_like(q)
+    if out_k is None:
+        out_k = torch.empty_like(k)
+    _rotary_apply_kernel[(rows,)](
         q,
         k,
-        inv_freq,
-        positions,
+        cos.reshape(rows, head_dim),
+        sin.reshape(rows, head_dim),
         out_q,
         out_k,
-        ROWS=rows,
         HEADS=heads,
         GROUPS=groups,
         HEAD_DIM=head_dim,
-        BLOCK_D=block,
-        MAX_POS=positions.numel(),
-        num_warps=4,
+        BLOCK_D=head_dim,
+        IS_F16=q.dtype is torch.float16,
+        num_warps=4 if head_dim >= 128 else 2,
         num_stages=1,
     )
     return out_q, out_k
