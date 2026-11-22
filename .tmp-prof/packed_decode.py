@@ -75,7 +75,7 @@ def main():
                 out = rlt_decode(q, key, val, tbl, ctx)
                 rep.add(case, "rlt-triton", None, None,
                         {"dev_ms": round(bench_device(lambda: rlt_decode(q, key, val, tbl, ctx))[0], 4),
-                         **err(out)})
+                         **err(out.clone())})
 
                 o = torch.empty_like(q)
                 lse = torch.empty((rows, heads), device="cuda", dtype=torch.float32)
@@ -87,7 +87,7 @@ def main():
                 decode_attention_fwd(**kw)
                 rep.add(case, "vllm-decode", None, None,
                         {"dev_ms": round(bench_device(lambda: decode_attention_fwd(**kw))[0], 4),
-                         **err(o)})
+                         **err(o.clone())})
 
                 cu = torch.arange(rows + 1, device="cuda", dtype=torch.int32)
                 uout = torch.empty_like(q)
@@ -102,7 +102,7 @@ def main():
 
                 run_u()
                 rep.add(case, "vllm-unified", None, None,
-                        {"dev_ms": round(bench_device(run_u)[0], 4), **err(uout)})
+                        {"dev_ms": round(bench_device(run_u)[0], 4), **err(uout.clone())})
 
     rep.dump(args.output)
 
