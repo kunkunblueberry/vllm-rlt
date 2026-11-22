@@ -147,58 +147,33 @@ def _paged_attention_kernel(
 
 @triton.jit
 def _paged_attention_grouped_kernel(
-    Q,
-    K,
-    V,
-    TABLES,
-    LENGTHS,
-    PART_M,
-    PART_L,
-    PART_O,
-    KS,
-    VS,
-    q_batch_stride: tl.constexpr,
-    q_head_stride: tl.constexpr,
-    q_dim_stride: tl.constexpr,
-    k_block_stride: tl.constexpr,
-    k_token_stride: tl.constexpr,
-    k_head_stride: tl.constexpr,
-    k_dim_stride: tl.constexpr,
-    v_block_stride: tl.constexpr,
-    v_token_stride: tl.constexpr,
-    v_head_stride: tl.constexpr,
-    v_dim_stride: tl.constexpr,
-    table_stride: tl.constexpr,
-    s_block_stride: tl.constexpr,
-    s_token_stride: tl.constexpr,
-    s_head_stride: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    HEAD_GROUPS: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    SCALE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    SPLITS: tl.constexpr,
-    WINDOW: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_H_DOT: tl.constexpr,
+    Q, K, V, TABLES, LENGTHS, PART_M, PART_L, PART_O, KS, VS,
+    q_batch_stride: tl.constexpr, q_head_stride: tl.constexpr, q_dim_stride: tl.constexpr,
+    k_block_stride: tl.constexpr, k_token_stride: tl.constexpr,
+    k_head_stride: tl.constexpr, k_dim_stride: tl.constexpr,
+    v_block_stride: tl.constexpr, v_token_stride: tl.constexpr,
+    v_head_stride: tl.constexpr, v_dim_stride: tl.constexpr,
+    table_stride: tl.constexpr, s_block_stride: tl.constexpr,
+    s_token_stride: tl.constexpr, s_head_stride: tl.constexpr,
+    HAS_SCALE: tl.constexpr, HEAD_DIM: tl.constexpr, HEAD_GROUPS: tl.constexpr,
+    NUM_HEADS: tl.constexpr, PAGE_SIZE: tl.constexpr, SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr, BLOCK_T: tl.constexpr, SPLITS: tl.constexpr,
+    WINDOW: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_H_DOT: tl.constexpr,
 ):
     """GQA decode: one program serves BLOCK_H query heads that share a KV head.
 
-    The per-head kernel re-reads the same KV tile once per query head, so with a group of
-    G it moves G times the KV bytes and issues G times the load instructions for identical
-    data. Batching the group means the tile is loaded once and reused by every query head in
-    it, which is what vLLM's grouped kernel does (`_fwd_grouped_kernel_stage1`, BLOCK_H).
+    The per-head kernel re-reads the same KV tile once per query head, so a group of G moves
+    G times the KV bytes and issues G times the load instructions for identical data.
+    Batching the group loads the tile once and reuses it for every head in it, which is what
+    vLLM's grouped kernel does (`_fwd_grouped_kernel_stage1`, BLOCK_H).
     """
     row = tl.program_id(0)
     head_block = tl.program_id(1)
     split = tl.program_id(2)
     first_head = head_block * BLOCK_H
-    # Heads beyond the group belong to the next KV head, so mask them off.
     heads = first_head + tl.arange(0, BLOCK_H)
-    head_mask = (heads < NUM_HEADS) & (heads < first_head + HEAD_GROUPS)
+    # Heads beyond this KV head's group belong to the next one; mask them off.
+    head_mask = heads < first_head + HEAD_GROUPS
     kv_head = first_head // HEAD_GROUPS
     length = tl.load(LENGTHS + row)
     covered = length if WINDOW == 0 else tl.minimum(length, WINDOW)
@@ -208,14 +183,12 @@ def _paged_attention_grouped_kernel(
     end = tl.minimum(length, begin + split_tokens)
     dims = tl.arange(0, BLOCK_D)
     dim_mask = dims < HEAD_DIM
+    # Keep the activation dtype for tl.dot: casting to fp32 takes it off the tensor-core path.
     query = tl.load(
-        Q
-        + row * q_batch_stride
-        + heads[:, None] * q_head_stride
-        + dims[None, :] * q_dim_stride,
+        Q + row * q_batch_stride + heads[:, None] * q_head_stride + dims[None, :] * q_dim_stride,
         mask=head_mask[:, None] & dim_mask[None, :],
-        other=0,
-    ).to(tl.float32)
+        other=0.0,
+    )
     maximum = tl.full((BLOCK_H,), -float("inf"), tl.float32)
     normalizer = tl.zeros((BLOCK_H,), tl.float32)
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
@@ -240,10 +213,12 @@ def _paged_attention_grouped_kernel(
             scale_offsets = (
                 blocks * s_block_stride + offsets * s_token_stride + kv_head * s_head_stride
             )
-            keys = tl.where(kv_mask, tl.load(key_pointers, mask=kv_mask).to(tl.float32), 0.0)
+            keys = tl.load(key_pointers, mask=kv_mask, other=0.0).to(tl.float32)
             keys = keys * tl.load(KS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
+            keys = keys.to(Q.dtype.element_ty)
         else:
-            keys = tl.load(key_pointers, mask=kv_mask, other=0).to(tl.float32)
+            keys = tl.load(key_pointers, mask=kv_mask, other=0.0)
+        # One tile, BLOCK_H dot products: the reuse the per-head kernel loses.
         scores = tl.dot(query, tl.trans(keys)) * SCALE
         scores = tl.where(valid_tokens[None, :], scores, -float("inf"))
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
@@ -258,14 +233,12 @@ def _paged_attention_grouped_kernel(
             + dims[None, :] * v_dim_stride
         )
         if HAS_SCALE:
-            values = tl.where(kv_mask, tl.load(value_pointers, mask=kv_mask).to(tl.float32), 0.0)
+            values = tl.load(value_pointers, mask=kv_mask, other=0.0).to(tl.float32)
             values = values * tl.load(VS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
+            values = values.to(Q.dtype.element_ty)
         else:
-            values = tl.load(value_pointers, mask=kv_mask, other=0).to(tl.float32)
-        # tl.dot needs both shapes as powers of two; zero-pad the head axis instead of
-        # tl.dot needs both shapes as powers of two; zero-pad the head axis instead of
-        # rounding BLOCK_H up, which would read query heads outside the group. The padding
-        # rows produce zeros that the masked store below discards.
+            values = tl.load(value_pointers, mask=kv_mask, other=0.0)
+        # tl.dot needs a power-of-two head axis; zero-pad and mask the extra rows back out.
         in_range = tl.arange(0, BLOCK_H_DOT) < BLOCK_H
         padded = tl.where(in_range[:, None], weights.to(values.dtype), 0.0)
         partial = tl.dot(padded, values, input_precision="ieee")
@@ -274,20 +247,22 @@ def _paged_attention_grouped_kernel(
         )
         normalizer = normalizer * correction + tl.sum(weights, axis=1)
         maximum = next_maximum
-    # Masked heads have an empty softmax: force a finite zero instead of 0/0 = NaN. The merge
-    # treats (-inf, 0, 0) as an empty part and weights it by zero.
+    # A masked head has an empty softmax: store (-inf, 0, 0), which the merge weights by
+    # zero, instead of letting 0/0 produce NaN.
     out = accumulator / tl.maximum(normalizer, 1e-30)[:, None]
     out = tl.where(head_mask[:, None], out, 0.0)
     maximum = tl.where(head_mask, maximum, -float("inf"))
     normalizer = tl.where(head_mask, normalizer, 0.0)
     part = (row * NUM_HEADS + heads) * SPLITS + split
-    tl.store(PART_M + part, maximum, mask=heads < NUM_HEADS)
-    tl.store(PART_L + part, normalizer, mask=heads < NUM_HEADS)
+    store_mask = heads < NUM_HEADS
+    tl.store(PART_M + part, maximum, mask=store_mask)
+    tl.store(PART_L + part, normalizer, mask=store_mask)
     tl.store(
         PART_O + part[:, None] * BLOCK_D + dims[None, :],
         out,
-        mask=(heads < NUM_HEADS)[:, None],
+        mask=store_mask[:, None],
     )
+
 
 @triton.jit
 def _paged_attention_merge_kernel(
