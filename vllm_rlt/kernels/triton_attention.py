@@ -183,6 +183,7 @@ def _paged_attention_grouped_kernel(
     SPLITS: tl.constexpr,
     WINDOW: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    BLOCK_H_DOT: tl.constexpr,
 ):
     """GQA decode: one program serves BLOCK_H query heads that share a KV head.
 
@@ -243,7 +244,6 @@ def _paged_attention_grouped_kernel(
             keys = keys * tl.load(KS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
         else:
             keys = tl.load(key_pointers, mask=kv_mask, other=0).to(tl.float32)
-        # One tile, BLOCK_H dot products: the reuse that the per-head kernel loses.
         scores = tl.dot(query, tl.trans(keys)) * SCALE
         scores = tl.where(valid_tokens[None, :], scores, -float("inf"))
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
@@ -262,19 +262,29 @@ def _paged_attention_grouped_kernel(
             values = values * tl.load(VS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
         else:
             values = tl.load(value_pointers, mask=kv_mask, other=0).to(tl.float32)
-        accumulator = accumulator * correction[:, None] + tl.dot(
-            weights.to(values.dtype), values, input_precision="ieee"
+        # tl.dot needs both shapes as powers of two; zero-pad the head axis instead of
+        # rounding BLOCK_H up, which would read query heads outside the group.
+        padded = tl.zeros((BLOCK_H_DOT, BLOCK_T), dtype=weights.dtype)
+        padded = tl.where(
+            (tl.arange(0, BLOCK_H_DOT) < BLOCK_H)[:, None], weights.to(values.dtype), padded
         )
+        partial = tl.dot(padded, values, input_precision="ieee")
+        accumulator = accumulator * correction[:, None] + partial[:BLOCK_H, :]
         normalizer = normalizer * correction + tl.sum(weights, axis=1)
         maximum = next_maximum
+    # Masked heads have an empty softmax: force a finite zero instead of 0/0 = NaN. The merge
+    # treats (-inf, 0, 0) as an empty part and weights it by zero.
     out = accumulator / tl.maximum(normalizer, 1e-30)[:, None]
+    out = tl.where(head_mask[:, None], out, 0.0)
+    maximum = tl.where(head_mask, maximum, -float("inf"))
+    normalizer = tl.where(head_mask, normalizer, 0.0)
     part = (row * NUM_HEADS + heads) * SPLITS + split
-    tl.store(PART_M + part, maximum, mask=head_mask)
-    tl.store(PART_L + part, normalizer, mask=head_mask)
+    tl.store(PART_M + part, maximum, mask=heads < NUM_HEADS)
+    tl.store(PART_L + part, normalizer, mask=heads < NUM_HEADS)
     tl.store(
         PART_O + part[:, None] * BLOCK_D + dims[None, :],
         out,
-        mask=head_mask[:, None],
+        mask=(heads < NUM_HEADS)[:, None],
     )
 
 @triton.jit
@@ -372,13 +382,13 @@ def paged_attention(
         HEAD_DIM=q.shape[-1],
         HEAD_GROUPS=head_groups,
         NUM_HEADS=heads,
-        PAGE_SIZE=key_cache.shape[1],
         SCALE=q.shape[-1] ** -0.5,
         BLOCK_D=block_d,
         BLOCK_T=32,
         SPLITS=NUM_SPLITS,
         WINDOW=window,
         BLOCK_H=block_h,
+        BLOCK_H_DOT=block_h,
         num_warps=4,
     )
     _paged_attention_merge_kernel[(rows, heads)](
