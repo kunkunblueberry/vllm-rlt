@@ -98,6 +98,26 @@ def test_cuda_batch_sampling_preserves_seeded_streams_when_rows_move():
 
 
 @pytest.mark.gpu
+def test_cuda_compact_candidates_keep_their_vocabulary_rng_draws():
+    torch.manual_seed(232)
+    logits = torch.randn((8, 49152), device="cuda")
+    params = SamplingParams(temperature=0.7, top_k=40, top_p=0.9)
+    seeds = range(len(logits))
+    legacy = [torch.Generator(device="cuda").manual_seed(i) for i in seeds]
+    batched = tuple(torch.Generator(device="cuda").manual_seed(i) for i in seeds)
+    sampler = Sampler()
+    for _ in range(12):
+        reference = torch.stack(
+            [sampler.sample(row, params, gen) for row, gen in zip(logits, legacy)]
+        )
+        assert torch.equal(
+            sampler.sample_batch(logits, (params,) * len(logits), batched), reference
+        )
+    for a, b in zip(legacy, batched):
+        assert torch.equal(a.get_state(), b.get_state())
+
+
+@pytest.mark.gpu
 def test_cuda_compact_sampling_matches_truncated_distribution():
     # Top-k keeps 0.50, 0.30 and 0.15. In that distribution top-p=0.75
     # crosses at token 3, leaving probabilities 5/8 and 3/8.

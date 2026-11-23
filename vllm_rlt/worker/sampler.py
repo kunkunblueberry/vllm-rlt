@@ -69,6 +69,7 @@ class Sampler:
         if temperature == 0:
             return logits.argmax(dim=-1)
         logits = logits.float() / temperature
+        noise = torch.empty_like(logits)
         indices = None
         if 0 < top_k < logits.shape[-1]:
             logits, indices = logits.topk(top_k, dim=-1, sorted=top_p < 1)
@@ -81,14 +82,14 @@ class Sampler:
             crossed = weights.cumsum(-1)[:, :-1] > top_p
             weights[:, 1:].masked_fill_(crossed, 0.0)
 
-        noise = torch.empty_like(weights)
+        # Keep one draw per vocabulary index so a token gets the same random
+        # value regardless of where it falls in the sorted candidate list.
         for row, generator in zip(noise, generators):
             if generator is None:
                 raise ValueError("non-greedy sampling requires a generator")
             row.exponential_(generator=generator)
-        # Independent exponential races implement the same categorical law as
-        # multinomial. Compact candidates change the mapping from a seed to a
-        # particular token compared with the previous full-vocabulary draws.
+        if indices is not None:
+            noise = noise.gather(1, indices)
         torch._assert_async(torch.isfinite(weights[:, 0]).all(), "invalid sampling probabilities")
         winner = (weights / noise).argmax(dim=-1, keepdim=True)
         return (winner if indices is None else indices.gather(1, winner)).squeeze(-1)
