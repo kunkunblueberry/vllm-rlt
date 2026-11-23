@@ -48,6 +48,72 @@ def test_greedy_leaves_a_supplied_generator_untouched():
     assert torch.equal(generator.get_state(), before)
 
 
+@pytest.mark.gpu
+def test_cuda_batch_greedy_selects_live_rows_in_order_with_ties():
+    logits = torch.tensor(
+        [[2.0, 6.0, 6.0], [0.0, -3.0, 2.0], [100.0, 0.0, 0.0]],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    params = (SamplingParams(top_k=1, top_p=0.1), SamplingParams())
+    torch.testing.assert_close(
+        Sampler().sample_batch(logits, params, (None, None)),
+        torch.tensor([1, 2], device="cuda"),
+    )
+
+
+@pytest.mark.gpu
+def test_cuda_batch_sampling_preserves_seeded_streams_when_rows_move():
+    logits = torch.tensor(
+        [[-9.0, 1.5, 1.0, 0.8], [0.0, 2.0, 1.0, -1.0], [2.0, 1.0, -9.0, 0.0]],
+        device="cuda",
+    )
+    first = SamplingParams(temperature=0.7, top_k=2, top_p=0.9, seed=71)
+    second = SamplingParams(temperature=0.8, top_p=0.85, seed=56)
+    greedy = SamplingParams()
+    sampler = Sampler()
+    reference = [seeded_generator(p, logits.device) for p in (first, second)]
+    mixed = [seeded_generator(p, logits.device) for p in (first, second)]
+    expected, actual = [], []
+    for _ in range(16):
+        expected.append(
+            torch.cat(
+                [
+                    sampler.sample_batch(logits[i : i + 1], (p,), (gen,))
+                    for i, (p, gen) in enumerate(zip((first, second), reference))
+                ]
+            )
+        )
+        sampled = sampler.sample_batch(
+            logits[[1, 2, 0]], (second, greedy, first), (mixed[1], None, mixed[0])
+        )
+        actual.append(sampled[[2, 0]])
+        assert sampled[1] == 0
+    expected = torch.stack(expected)
+    torch.testing.assert_close(torch.stack(actual), expected)
+    assert set(expected[:, 0].tolist()) == {1, 2}
+    assert set(expected[:, 1].tolist()) == {1, 2}
+    for a, b in zip(reference, mixed):
+        assert torch.equal(a.get_state(), b.get_state())
+
+
+@pytest.mark.gpu
+def test_cuda_compact_sampling_matches_truncated_distribution():
+    # Top-k keeps 0.50, 0.30 and 0.15. In that distribution top-p=0.75
+    # crosses at token 3, leaving probabilities 5/8 and 3/8.
+    logits = torch.tensor([0.05, 0.50, 0.15, 0.30], device="cuda").log()
+    rows = 128
+    params = SamplingParams(temperature=1.0, top_k=3, top_p=0.75)
+    generators = tuple(torch.Generator(device="cuda").manual_seed(i) for i in range(rows))
+    sampler = Sampler()
+    batch = logits.expand(rows, -1)
+    samples = torch.cat(
+        [sampler.sample_batch(batch, (params,) * rows, generators) for _ in range(32)]
+    )
+    assert set(samples.tolist()) == {1, 3}
+    assert 0.59 < (samples == 1).float().mean().item() < 0.66
+
+
 def test_non_greedy_requires_a_generator():
     # None would silently draw from the process-wide default generator, so the
     # contract is an explicit error rather than an implicit fallback.

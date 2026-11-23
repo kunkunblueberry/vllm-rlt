@@ -1148,21 +1148,9 @@ class ModelRunner:
                         )
                         values = selected.float().sigmoid()
             elif forward.compute_logits:
-                if self.device.type == "npu":
-                    values = self.sampler.sample_batch(
-                        result.logits, prepared.sampling_params, prepared.sampling_generators
-                    )
-                else:
-                    values = torch.stack(
-                        [
-                            self.sampler.sample(row, params, generator)
-                            for row, params, generator in zip(
-                                result.logits,
-                                prepared.sampling_params,
-                                prepared.sampling_generators,
-                            )
-                        ]
-                    )
+                values = self.sampler.sample_batch(
+                    result.logits, prepared.sampling_params, prepared.sampling_generators
+                )
                 if prepared.routing is not None:
                     prepared.routing.scatter(values, tokens=True)
         return values

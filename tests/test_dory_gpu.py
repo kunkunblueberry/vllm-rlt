@@ -369,13 +369,16 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(
         packed_layers = set()
         short_logits = []
         sampler = engine.model_runner.sampler
-        original_sample = sampler.sample
+        original_sample = sampler.sample_batch
         original_attention = engine.cache_manager._attend_prepared
 
-        def sample(logits, params, generator):
-            if params is short_options:
-                short_logits.append(logits.detach().cpu())
-            return original_sample(logits, params, generator)
+        def sample(logits, params, generators):
+            short_logits.extend(
+                row.detach().cpu()
+                for row, options in zip(logits, params)
+                if options is short_options
+            )
+            return original_sample(logits, params, generators)
 
         def attention(layer, metadata, q, *, window=None):
             if metadata.cu_seqlens_q is not None:
@@ -385,7 +388,7 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(
 
         short_options = SamplingParams(max_tokens=3, ignore_eos=True)
         with monkeypatch.context() as mp:
-            mp.setattr(sampler, "sample", sample)
+            mp.setattr(sampler, "sample_batch", sample)
             mp.setattr(engine.cache_manager, "_attend_prepared", attention)
             try:
                 assert engine.execution_config.packed_prefill is expect_packed

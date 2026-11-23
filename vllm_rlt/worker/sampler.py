@@ -1,4 +1,4 @@
-"""Greedy, top-k and top-p sampling for a single logits row.
+"""Greedy, top-k and top-p sampling for single rows and CUDA CODA batches.
 
 The arithmetic was moved out of ``ModelRunner``'s per-row sampling helper so the
 sampling contract can be pinned by unit tests without a runner. ``probabilities``
@@ -22,7 +22,76 @@ from vllm_rlt.sampling_params import SamplingParams
 
 
 class Sampler:
-    """Greedy / top-k / top-p sampling for one logits row."""
+    """Greedy and random token sampling with caller-owned generators."""
+
+    def sample_batch(
+        self,
+        logits: torch.Tensor,
+        params: tuple[SamplingParams, ...],
+        generators: tuple[torch.Generator | None, ...],
+    ) -> torch.Tensor:
+        """Sample the live CODA rows in their original order."""
+        logits = logits[: len(params)]
+        if not logits.is_cuda:
+            return torch.stack(
+                [self.sample(row, p, gen) for row, p, gen in zip(logits, params, generators)]
+            )
+        if len(params) == 1 and params[0].temperature == 0:
+            return self.sample(logits[0], params[0], generators[0]).view(1)
+        if all(p.temperature == 0 for p in params):
+            return logits.argmax(dim=-1)
+
+        groups = {}
+        for row, p in enumerate(params):
+            groups.setdefault((p.temperature, p.top_k, p.top_p), []).append(row)
+        if len(groups) == 1:
+            return self._sample_cuda_group(logits, *next(iter(groups)), generators)
+
+        result = [None] * len(params)
+        for (temperature, top_k, top_p), rows in groups.items():
+            if rows[-1] - rows[0] + 1 == len(rows):
+                group_logits = logits[rows[0] : rows[-1] + 1]
+            else:
+                group_logits = torch.stack([logits[row] for row in rows])
+            sampled = self._sample_cuda_group(
+                group_logits,
+                temperature,
+                top_k,
+                top_p,
+                [generators[row] for row in rows],
+            )
+            for row, token in zip(rows, sampled.unbind()):
+                result[row] = token
+        return torch.stack(result)
+
+    @staticmethod
+    def _sample_cuda_group(logits, temperature, top_k, top_p, generators):
+        if temperature == 0:
+            return logits.argmax(dim=-1)
+        logits = logits.float() / temperature
+        indices = None
+        if 0 < top_k < logits.shape[-1]:
+            logits, indices = logits.topk(top_k, dim=-1, sorted=top_p < 1)
+        elif top_p < 1:
+            logits, indices = logits.sort(dim=-1, descending=True)
+
+        weights = logits.softmax(dim=-1)
+        if top_p < 1:
+            # Keep the token that crosses p, matching the single-row sampler.
+            crossed = weights.cumsum(-1)[:, :-1] > top_p
+            weights[:, 1:].masked_fill_(crossed, 0.0)
+
+        noise = torch.empty_like(weights)
+        for row, generator in zip(noise, generators):
+            if generator is None:
+                raise ValueError("non-greedy sampling requires a generator")
+            row.exponential_(generator=generator)
+        # Independent exponential races implement the same categorical law as
+        # multinomial. Compact candidates change the mapping from a seed to a
+        # particular token compared with the previous full-vocabulary draws.
+        torch._assert_async(torch.isfinite(weights[:, 0]).all(), "invalid sampling probabilities")
+        winner = (weights / noise).argmax(dim=-1, keepdim=True)
+        return (winner if indices is None else indices.gather(1, winner)).squeeze(-1)
 
     @staticmethod
     def probabilities(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
