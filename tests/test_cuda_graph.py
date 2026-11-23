@@ -105,6 +105,61 @@ def test_graph_cache_limit_fallback_and_abort():
     assert engine.model_runner.graphs.fallbacks > 0
 
 
+@pytest.mark.gpu
+def test_pd_decode_reuses_buckets_without_committing_padding():
+    from vllm_rlt.engine.stage_config import StageConfig
+    from vllm_rlt.engine.stage_engine import StageEngine
+
+    torch.manual_seed(19)
+    model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
+
+    def stage(graphs):
+        return StageEngine(
+            model,
+            stage_config=StageConfig(stage_id="decode", role="decode"),
+            cache_config=CacheConfig(num_blocks=32, block_size=16),
+            scheduler_config=SchedulerConfig(max_num_seqs=4, max_num_batched_tokens=4),
+            execution_config=ExecutionConfig(
+                cuda_graphs=graphs, cuda_graph_max_batch_size=4, cuda_graph_max_graphs=2
+            ),
+            attention_backend="triton",
+        )
+
+    with torch.inference_mode():
+        eager, graph = stage(False), stage(True)
+        caches = (eager.cache_manager, graph.cache_manager)
+        for cache in caches:
+            for row in range(4):
+                cache.allocate(str(row), 16)
+            cache.key_cache.fill_(-9)
+            cache.value_cache.fill_(-11)
+        graph_runner = graph.model_runner.graphs
+        lengths = [0] * 4
+        for count in (4, 3, 1, 2, 4):
+            ids = [str(row) for row in range(count)]
+            positions = lengths[:count]
+            hidden = model.prelude(torch.arange(2, count + 2, device="cuda"))
+            a, b = [cache._prepare_batch(ids, [0] * count, positions) for cache in caches]
+            expected, expected_gate = model.recurrent_prepared(hidden, a, caches[0])
+            call = graph_runner.select(hidden, b)
+            graph_runner.prepare_inputs(call, hidden)
+            actual, actual_gate = graph_runner.execute(call, hidden)
+            torch.testing.assert_close(actual, expected, atol=0.016, rtol=0.01)
+            torch.testing.assert_close(actual_gate, expected_gate, atol=0.002, rtol=0.01)
+            # Entire pool equality catches writes to padding or stale rows from
+            # the prior replay, including offsets that have not been published.
+            torch.testing.assert_close(
+                caches[1].key_cache, caches[0].key_cache, atol=0.016, rtol=0.01
+            )
+            torch.testing.assert_close(
+                caches[1].value_cache, caches[0].value_cache, atol=0.016, rtol=0.01
+            )
+            lengths[:count] = [pos + 1 for pos in positions]
+    assert graph_runner.captures == 2
+    assert graph_runner.replays == 5
+    assert graph_runner.fallbacks == 0
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_speculative_graph_memory_budget_scales_with_pools_and_retained_outputs(enabled):
     from dataclasses import replace
@@ -506,7 +561,9 @@ def test_triton_graph_fuses_unmasked_key_and_value_writes(dtype):
 
     keys = torch.full((5, 2, 4, 3, 9), -1, dtype=dtype, device="cuda")
     values = torch.full_like(keys, -2)
-    proxy = _DeviceCache(SimpleNamespace(key_cache=keys, value_cache=values, backend="triton"))
+    proxy = _DeviceCache(
+        SimpleNamespace(key_cache=keys, value_cache=values, key_scale=None, backend="triton")
+    )
     batch = SimpleNamespace(
         active_rows=None,
         write_mask=None,

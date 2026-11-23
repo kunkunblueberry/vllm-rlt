@@ -238,7 +238,7 @@ class PreparedGraph:
 
 
 class RecurrentGraphs:
-    def __init__(self, model, cache, execution, compute_gate):
+    def __init__(self, model, cache, execution, compute_gate, *, bucket_decode=False):
         self.model, self.cache = model, cache
         self.execution, self.compute_gate = execution, compute_gate
         self.entries = {}
@@ -247,6 +247,7 @@ class RecurrentGraphs:
         self.last_event = None
         self.captures = self.replays = self.fallbacks = 0
         self.warned_cache_full = False
+        self.decode_sizes = graph_capture_sizes(execution) if bucket_decode else ()
 
     def select(self, hidden, batch):
         count = _query_count(batch)
@@ -258,12 +259,18 @@ class RecurrentGraphs:
                 context_lengths=batch.context_lengths[:count],
                 block_tables=batch.block_tables[:count],
             )
+        bucketed = bool(self.decode_sizes) and not packed and len(batch.context_lengths) == count
+        capacity = _bucket_size(self.decode_sizes, count) if bucketed else count
         key = (
-            count,
-            len(batch.context_lengths),
-            batch.max_seqlen_q if packed else 1,
-            packed,
-            getattr(batch, "write_mask", None) is not None,
+            capacity
+            if bucketed
+            else (
+                count,
+                len(batch.context_lengths),
+                batch.max_seqlen_q if packed else 1,
+                packed,
+                getattr(batch, "write_mask", None) is not None,
+            )
         )
         frontier = {}
         contiguous = True
@@ -286,7 +293,12 @@ class RecurrentGraphs:
         entry = self.entries.get(key)
         if entry is None:
             entry = _graph_entry(
-                hidden, batch, self.cache, self.model.config.max_position_embeddings
+                hidden,
+                batch,
+                self.cache,
+                self.model.config.max_position_embeddings,
+                count=capacity,
+                bucketed=bucketed,
             )
             entry.graph = None
             self.entries[key] = entry

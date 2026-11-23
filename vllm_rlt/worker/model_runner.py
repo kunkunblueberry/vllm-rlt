@@ -161,6 +161,7 @@ class ModelRunner:
         scheduler_config=None,
         staged_prefill=None,
         rng: RngRegistry | None = None,
+        bucket_decode_graphs: bool = False,
     ):
         self.model = model.eval()
         self.cache_manager = cache_manager
@@ -183,6 +184,7 @@ class ModelRunner:
                 cache_manager,
                 self.execution_config,
                 self.exit_config.mode in ("ouro", "ouro_delayed"),
+                bucket_decode=bucket_decode_graphs,
             )
             if self.execution_config.cuda_graphs
             else None

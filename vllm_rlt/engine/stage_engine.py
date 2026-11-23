@@ -314,6 +314,12 @@ class StageEngine:
             scheduler_config=scheduler_config,
             staged_prefill=self.scheduler.staged_prefill,
             rng=self.rng,
+            bucket_decode_graphs=(
+                self.stage_config.role == "decode"
+                and self.cache_manager.backend == "triton"
+                and not getattr(model, "requires_boundary_kv", False)
+                and speculative_config is None
+            ),
         )
         self.speculative_runner = (
             SpeculativeRunner(

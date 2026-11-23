@@ -56,6 +56,11 @@ batches. PD can configure speculation on its decode stage.
 See [runtime configuration](runtime.md#execution-batches-and-mixed-scheduling)
 for constraints and [the architecture](unified_execution.md) for ownership.
 
+With CUDA graphs enabled, Triton PD decode uses bounded recurrent batch
+buckets for ordinary non-speculative models without boundary KV. Padded rows
+have zero context and cannot write KV. The existing CUDA Graph row and cache
+limits bound the captured buckets.
+
 ## Completions contract
 
 `POST /v1/completions` requires `Content-Type: application/json`, `model` and one
